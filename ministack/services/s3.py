@@ -29,6 +29,7 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ import time
 import zlib
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
+from urllib.parse import quote_plus as _url_quote_plus
 from urllib.parse import unquote as url_unquote
 from urllib.parse import urlparse as _urlparse
 from xml.etree.ElementTree import Element, ParseError, SubElement, tostring
@@ -3369,6 +3371,33 @@ def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str | None]:
     return detail_type, reason
 
 
+# The notification record's `sequencer`: a hexadecimal string that grows with
+# every create and delete, so "the event notification with the greater
+# `sequencer` hexadecimal value is the event that occurred later" for one key
+# (S3 User Guide, "Event message structure"). Taken when the write happens,
+# not when the background thread builds the record, so it orders the writes.
+# Seeded from the clock so values keep growing across a restart.
+_event_sequence = itertools.count(time.time_ns() // 1000)
+_EVENT_SEQUENCED_FAMILIES = ("s3:ObjectCreated:", "s3:ObjectRemoved:")
+
+
+def _next_event_sequencer(event_name: str) -> str | None:
+    """A sequencer for an object create or delete event; None for the others,
+    which the record carries no sequencer for ("only used with PUT and DELETE
+    requests")."""
+    if not event_name.startswith(_EVENT_SEQUENCED_FAMILIES):
+        return None
+    return f"{next(_event_sequence):018X}"
+
+
+def _event_object_key(key: str) -> str:
+    """The key as a notification record carries it: "The object key name value
+    is URL encoded. For example, `red flower.jpg` becomes `red+flower.jpg`"
+    (S3 User Guide, "Event message structure"); slashes are left as they are.
+    EventBridge details carry the key as stored."""
+    return _url_quote_plus(key, safe="/")
+
+
 def _fire_s3_event(
     bucket_name: str,
     key: str,
@@ -3377,8 +3406,18 @@ def _fire_s3_event(
     etag: str = "",
     deletion_type: str | None = None,
     restore_event_data: dict | None = None,
+    version_id: str | None = None,
+    sequencer: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
-    """Build and deliver an S3 event notification. Best-effort — errors are logged."""
+    """Build and deliver an S3 event notification. Best-effort — errors are logged.
+
+    `version_id` is the version the write made or removed ("null or not present
+    if the bucket isn't versioning-enabled"), `sequencer` the one taken when it
+    happened, `object_extra` fields the record's `s3.object` gains for this
+    event (`hasObjectAnnotation` on a copy), and `record_extra` fields the record
+    itself gains (`objectAnnotation` on an annotation event)."""
     try:
         configs = _parse_notification_config(bucket_name)
         raw_xml = _bucket_notifications.get(bucket_name, "")
@@ -3391,11 +3430,19 @@ def _fire_s3_event(
         event_time = now_iso()
         request_id = new_uuid()
         clean_etag = etag.strip('"')
+        event_object = {"key": _event_object_key(key), "size": size, "eTag": clean_etag}
+        if version_id:
+            event_object["versionId"] = version_id
+        if sequencer:
+            event_object["sequencer"] = sequencer
+        if object_extra:
+            event_object.update(object_extra)
 
         event_payload = {
             "Records": [
                 {
-                    "eventVersion": "2.1",
+                    # One unified version for every event type since 2.4.
+                    "eventVersion": "2.6",
                     "eventSource": "aws:s3",
                     "awsRegion": bucket_region,
                     "eventTime": event_time,
@@ -3414,16 +3461,13 @@ def _fire_s3_event(
                             "ownerIdentity": {"principalId": "EXAMPLE"},
                             "arn": f"arn:aws:s3:::{bucket_name}",
                         },
-                        "object": {
-                            "key": key,
-                            "size": size,
-                            "eTag": clean_etag,
-                            "sequencer": "0",
-                        },
+                        "object": event_object,
                     },
                 }
             ],
         }
+        if record_extra:
+            event_payload["Records"][0].update(record_extra)
         if restore_event_data:
             # glacierEventData appears only on s3:ObjectRestore:Completed.
             event_payload["Records"][0]["glacierEventData"] = {
@@ -3461,7 +3505,7 @@ def _fire_s3_event(
                     "version": "0",
                     "event-version": "1.0",
                     "bucket": {"name": bucket_name},
-                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
+                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": sequencer or "0"},
                     "request-id": request_id,
                     "requester": get_account_id(),
                     "source-ip-address": "127.0.0.1",
@@ -3590,10 +3634,14 @@ def _fire_s3_event_async(
     size: int = 0,
     etag: str = "",
     deletion_type: str | None = None,
+    version_id: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
         return
+    sequencer = _next_event_sequencer(event_name)
     # threading.Thread does not copy contextvars, so without this snapshot the
     # worker runs under the default account (000000000000): the account-scoped
     # _bucket_notifications lookup comes back empty and the event is silently
@@ -3604,6 +3652,12 @@ def _fire_s3_event_async(
     t = threading.Thread(
         target=ctx.run,
         args=(_fire_s3_event, bucket_name, key, event_name, size, etag, deletion_type),
+        kwargs={
+            "version_id": version_id,
+            "sequencer": sequencer,
+            "object_extra": object_extra,
+            "record_extra": record_extra,
+        },
         daemon=True,
     )
     t.start()
@@ -3696,14 +3750,16 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
         if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
-    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"])
-
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
     resp_headers.update(sse_headers)
     _maybe_replicate(bucket_name, key, obj, body)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    # After the version is cut, so the record names it.
+    _fire_s3_event_async(
+        bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"], version_id=version_id
+    )
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
@@ -3941,10 +3997,9 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
         if len(parsed) <= 10:
             pending_tags = parsed
 
-    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag)
-
     _maybe_replicate(bucket_name, key, obj, file_value)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag, version_id=version_id)
 
     if pending_tags is not None:
         _object_tags[(bucket_name, key, version_id)] = pending_tags
@@ -4697,7 +4752,7 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         if was_delete_marker:
             resp_headers["x-amz-delete-marker"] = "true"
         if _found:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", version_id=version_id)
         return 204, resp_headers, b""
 
     versioning = _bucket_versioning.get(bucket_name, "")
@@ -4707,7 +4762,15 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None, quer
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
         if existed:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", deletion_type="Delete Marker Created")
+            # "s3:ObjectRemoved:DeleteMarkerCreated" is its own event type:
+            # s3:ObjectRemoved:Delete is for an object or version that is gone.
+            _fire_s3_event_async(
+                bucket_name,
+                key,
+                "s3:ObjectRemoved:DeleteMarkerCreated",
+                deletion_type="Delete Marker Created",
+                version_id=delete_marker_id,
+            )
         return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": delete_marker_id}, b""
 
     existed = key in bucket["objects"]
@@ -4993,14 +5056,6 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     else:
         _object_legal_hold.pop((bucket_name, dest_key), None)
 
-    _fire_s3_event_async(
-        bucket_name,
-        dest_key,
-        "s3:ObjectCreated:Copy",
-        size=dest_obj["size"],
-        etag=new_etag,
-    )
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(dest_sse)
     if copy_src_vid:
@@ -5011,6 +5066,14 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     version_id = _record_object_version(bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    _fire_s3_event_async(
+        bucket_name,
+        dest_key,
+        "s3:ObjectCreated:Copy",
+        size=dest_obj["size"],
+        etag=new_etag,
+        version_id=version_id,
+    )
 
     dest_version_id = dest_obj.get("version_id")
     if pending_dest_tags is not None:
@@ -5955,15 +6018,31 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
             # S3 reports the delete as successful even if the version was absent.
             _found, was_marker = _delete_object_version(bucket, bucket_name, k, version_id)
             deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+            # "notification when an object or a batch of objects is removed":
+            # each entry sends what the single-object DELETE would.
+            if _found:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete", version_id=version_id)
         elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
             # No VersionId on a versioned bucket: create a delete marker —
             # even for a key that never existed — exactly as the single-object
             # DELETE does, and report it on the Deleted entry.
+            existed = k in bucket["objects"]
             marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
             bucket["objects"].pop(k, None)
             deleted.append({"key": k, "version_id": "", "was_marker": False, "marker_created": marker_id})
+            if existed:
+                _fire_s3_event_async(
+                    bucket_name,
+                    k,
+                    "s3:ObjectRemoved:DeleteMarkerCreated",
+                    deletion_type="Delete Marker Created",
+                    version_id=marker_id,
+                )
         else:
             # No VersionId → plain delete of the current object.
+            existed = k in bucket["objects"]
+            if existed:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete")
             bucket["objects"].pop(k, None)
             _object_tags.pop((bucket_name, k, None), None)
             _object_retention.pop((bucket_name, k), None)
@@ -6388,20 +6467,20 @@ def _complete_multipart_upload(
 
     del _multipart_uploads[upload_id]
 
-    _fire_s3_event_async(
-        bucket_name,
-        key,
-        "s3:ObjectCreated:CompleteMultipartUpload",
-        size=obj["size"],
-        etag=final_etag,
-    )
-
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
     _maybe_replicate(bucket_name, key, obj, combined)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
+    _fire_s3_event_async(
+        bucket_name,
+        key,
+        "s3:ObjectCreated:CompleteMultipartUpload",
+        size=obj["size"],
+        etag=final_etag,
+        version_id=version_id,
+    )
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058).

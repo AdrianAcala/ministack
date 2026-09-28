@@ -10,6 +10,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **DynamoDB — `DescribeTable` accepts a table ARN** — `TableName` given as the table's ARN answered `ResourceNotFoundException`, where AWS accepts either form. It now resolves through the same ARN normalization the other table operations use, and an ARN from another account or region still answers `ResourceNotFoundException`. This unblocks OpenSearch Data Prepper's DynamoDB source, which always describes the table by ARN.
+- **S3 — event notification records match S3's** — the object block carries the key URL-encoded (`red flower.jpg` → `red+flower.jpg`), the `versionId` the write made or removed, and a `sequencer` that grows with every create and delete (it was always `"0"`); records are `eventVersion` `2.6`. A delete that leaves a delete marker is `ObjectRemoved:DeleteMarkerCreated` (it was `ObjectRemoved:Delete`, so a subscription to permanent deletes received markers), and `DeleteObjects` sends an event for each object it removes (it sent none). Checked against the S3 User Guide's "Event message structure" and "Event notification types and destinations" pages; not validated against a real AWS account.
 - **STS — `GetCallerIdentity` resolves IAM-user callers** — keys created with `CreateAccessKey` returned the `root` ARN; they now return the user's ARN and ID in both XML and JSON protocols. Under `AUTH=true`, unknown and inactive keys are rejected instead of reported as root.
 
 ## [1.5.17] — 2026-09-25
