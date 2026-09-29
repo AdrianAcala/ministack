@@ -5,6 +5,12 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Lambda — VPC configuration includes `VpcId`** — `CreateFunction`, `GetFunction`, `GetFunctionConfiguration`, and `UpdateFunctionConfiguration` now report the VPC of the configured subnets. Previously, VPC-attached functions returned only subnet and security group IDs. Contributed by @jayjanssen.
+
 ## [1.5.18] — 2026-09-28
 
 ### Added
