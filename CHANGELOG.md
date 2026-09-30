@@ -7,6 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CloudFormation — change set members follow the action** — `Add` and `Remove` changes carried `Replacement: False`, a `Remove` had no physical id, `PolicyAction` was never sent and a `Metadata` or policy detail had no `RequiresRecreation`. `Remove` and `Modify` now name the physical resource, a `Remove` answers `PolicyAction: Delete` and a replacing `Modify` `ReplaceAndDelete` unless the resource retains or snapshots, and attribute details answer `Never`. Contributed by @iot-rocket.
+- **CloudFormation — `AWS::SQS::Queue` applies every queue property** — `RedrivePolicy`, `RedriveAllowPolicy`, `KmsMasterKeyId`, `KmsDataKeyReusePeriodSeconds`, `SqsManagedSseEnabled`, `DeduplicationScope` and `FifoThroughputLimit` were dropped on create and update, so a dead-letter queue declared in a template never received messages, and a value SQS refuses now fails the resource instead of being stored. Contributed by @iot-rocket.
+- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early. Timeout updates recycle warm containers so the RIE deadline follows the new configuration (#1844).
+- **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
+- **CloudFormation — a nested stack's update deletes the resources its template drops** — a resource removed from the child template, or created by a failed child update that was rolled back, stayed in its service and in the nested stack's resource list. Contributed by @iot-rocket.
 ### Added
 
 - **RDS — IAM database authentication for MySQL and Aurora MySQL** — users created `IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'` log in with an SDK-generated token over `mysql_clear_password`, as on AWS. The instance or cluster must have `IAMDatabaseAuthenticationEnabled`; with `AUTH=true` the token and the `rds-db:connect` policy are verified too. `ModifyDBInstance` accepts `EnableIAMDatabaseAuthentication`. Contributed by @Areson.
