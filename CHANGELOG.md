@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Lambda — Docker executor honors timeouts above 300 seconds** — pass the configured `Timeout` to AWS RIE through `AWS_LAMBDA_FUNCTION_TIMEOUT`, preventing its default 300-second limit from ending longer invocations early. Timeout updates recycle warm containers so the RIE deadline follows the new configuration (#1844).
 - **KMS — `GenerateDataKey` returns `KeyMaterialId`** — requests without `Recipient` now include the identifier of the wrapping key material. The identifier remains stable across requests and persistence reloads, and changes when the wrapping material changes. Fixes #1853.
 ### Added
 
