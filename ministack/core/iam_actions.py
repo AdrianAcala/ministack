@@ -40,7 +40,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "bedrock": "bedrock",
     "bedrock-agent": "bedrock",
     "bedrock-agent-runtime": "bedrock",
-    "bedrock-agentcore": "bedrock",
+    "bedrock-agentcore": "bedrock-agentcore",
     "bedrock-runtime": "bedrock",
     "cloudcontrol": "cloudformation",
     "cloudformation": "cloudformation",
@@ -456,7 +456,9 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "bedrock-runtime": ["bedrock-runtime"],
     "bedrock-agent": ["bedrock-agent"],
     "bedrock-agent-runtime": ["bedrock-agent-runtime"],
-    "bedrock-agentcore": [],  # no botocore model yet
+    # InvokeAgentRuntime is mapped explicitly below so AUTH works even with
+    # Botocore versions that predate the AgentCore service model.
+    "bedrock-agentcore": [],
     "cloudfront": ["cloudfront"],
     "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
     "dsql": ["dsql"],
@@ -656,6 +658,12 @@ def _match_rest_action(service: str, method: str, path: str,
     return best_match
 
 
+def _agentcore_runtime_arn(path: str) -> str | None:
+    """Extract the runtime ARN from an InvokeAgentRuntime URI."""
+    match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
+    return match.group(1) if match else None
+
+
 def extract_iam_action(service: str, method: str, path: str,
                        headers: dict, body: bytes,
                        query_params: dict) -> str | None:
@@ -686,6 +694,10 @@ def extract_iam_action(service: str, method: str, path: str,
         action_name = _lambda_action(method, path)
         if action_name:
             return f"lambda:{action_name}"
+
+    if service == "bedrock-agentcore" and method == "POST":
+        if _agentcore_runtime_arn(path):
+            return "bedrock-agentcore:InvokeAgentRuntime"
 
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
@@ -846,6 +858,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         if resources:
             return resources[0]
         return "*"
+
+    if service == "bedrock-agentcore" and method == "POST":
+        return _agentcore_runtime_arn(path) or "*"
 
     if service == "lambda":
         # Path: /2015-03-31/functions/{name}/...
