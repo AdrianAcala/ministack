@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`.
+
 ## [1.5.19] — 2026-09-30
 
 ### Added
