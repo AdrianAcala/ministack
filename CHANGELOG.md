@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **API Gateway v2 (HTTP API) — a missing identity source is a 401 without caching too** — a REQUEST authorizer's short circuit for a declared identity source missing from the request only fired with `authorizerResultTtlInSeconds` caching on; with caching off the authorizer was invoked. AWS answers `401 {"message":"Unauthorized"}` (compact JSON) without invoking it either way, as observed on a deployed HTTP API with a TTL of 0. `$context.*` identity sources, which MiniStack does not model, do not count as missing without caching.
 ### Added
 
 - **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS. Contributed by @iot-rocket.
