@@ -720,17 +720,11 @@ _CUSTOM_NAME_REPLACEMENT = {
             old.get("Scope", "REGIONAL") != new.get("Scope", "REGIONAL")
         ),
     },
-    # createOnlyProperties of the published registry schemas, the name itself
-    # aside. "If you specify a name, you can't perform updates that require
-    # replacement" (aws-properties-name).
+    # "Update requires: Replacement" in the template reference, the name
+    # itself aside.
     "AWS::ElastiCache::CacheCluster": {
         "name": "ClusterName",
-        "requires_replacement": lambda old, new: any(
-            old.get(p) != new.get(p) for p in (
-                "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName",
-                "Engine", "NetworkType",
-            )
-        ),
+        "requires_replacement": lambda old, new: _ec_cluster_requires_replacement(old, new),
     },
     "AWS::ElastiCache::ReplicationGroup": {
         "name": "ReplicationGroupId",
@@ -6676,6 +6670,18 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
+def _codebuild_cfn_to_api(value):
+    """Spell a Source, Artifacts or Environment property the way the CodeBuild
+    API does. The template PascalCases the API's camelCase members (Type,
+    Image, EnvironmentVariables, ...) and calls the inline build spec BuildSpec
+    where the API has ``buildspec``; the build runner reads the API names.
+    """
+    value = _pascal_to_camel(value)
+    if isinstance(value, dict) and "buildSpec" in value:
+        value["buildspec"] = value.pop("buildSpec")
+    return value
+
+
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
     
@@ -6686,14 +6692,14 @@ def _codebuild_project_create(logical_id, props, stack_name):
     data = {
         "name": name,
         "description": props.get("Description", ""),
-        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "source": _codebuild_cfn_to_api(props.get("Source", {"type": "NO_SOURCE"})),
         "sourceVersion": props.get("SourceVersion", ""),
-        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
-        "environment": props.get("Environment", {
+        "artifacts": _codebuild_cfn_to_api(props.get("Artifacts", {"type": "NO_ARTIFACTS"})),
+        "environment": _codebuild_cfn_to_api(props.get("Environment", {
             "type": "LINUX_CONTAINER",
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
-        }),
+        })),
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
@@ -7385,11 +7391,19 @@ def _ec2_vpc_gw_attachment(props):
             {"VpcId": vpc_id, "State": "available"}, f"IGW|{vpc_id}")
 
 
-def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
-    """Attach the gateway; a replaced attachment stays until its own delete."""
+def _ec2_vpc_gw_attach_create(logical_id, props, stack_name, replacing=False):
+    """Attach the gateway; a replaced attachment stays until its own delete.
+
+    An internet gateway attaches to one VPC at a time. CloudFormation ignores
+    AttachInternetGateway's Resource.AlreadyAssociated, so a gateway already on
+    another VPC stays there; only this resource's own replacement may briefly
+    hold both until the old attachment is deleted.
+    """
     gateway, attachment, physical_id = _ec2_vpc_gw_attachment(props)
     if gateway:
         _ec2_vpc_gw_attach_delete(physical_id, props)
+        if gateway.get("InternetGatewayId") and gateway["Attachments"] and not replacing:
+            return physical_id, {}
         gateway["Attachments"].append(attachment)
     return physical_id, {}
 
@@ -7399,7 +7413,8 @@ def _ec2_vpc_gw_attach_update(physical_id, old_props, new_props, stack_name, log
     replaced = _rename_replacement(
         physical_id, old_props, new_props, stack_name, logical_id,
         _ec2_vpc_gw_attachment(new_props)[2], _ec2_vpc_gw_attachment(old_props)[2],
-        _ec2_vpc_gw_attach_create, _ec2_vpc_gw_attach_delete,
+        lambda lid, props, stack: _ec2_vpc_gw_attach_create(lid, props, stack, replacing=True),
+        _ec2_vpc_gw_attach_delete,
     )
     if replaced is not None:
         return replaced
@@ -7621,11 +7636,8 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "revision": revision,
         "status": "ACTIVE",
         "containerDefinitions": _normalize_container_defs(props.get("ContainerDefinitions", [])),
-        "requiresCompatibilities": compat,
         "compatibilities": compat + (["EC2"] if "FARGATE" in compat and "EC2" not in compat else []),
         "networkMode": props.get("NetworkMode", "bridge"),
-        "cpu": props.get("Cpu", "256"),
-        "memory": props.get("Memory", "512"),
         "executionRoleArn": props.get("ExecutionRoleArn", ""),
         "taskRoleArn": props.get("TaskRoleArn", ""),
         "volumes": props.get("Volumes", []),
@@ -7635,6 +7647,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "registeredAt": now_iso(),
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
     }
+    for prop, key in (("RequiresCompatibilities", "requiresCompatibilities"), ("Cpu", "cpu"),
+                      ("Memory", "memory")):
+        if prop in props:
+            td[key] = props[prop]
     _ecs._task_defs[td_key] = td
     _ecs._task_def_latest[family] = revision
     return arn, {"TaskDefinitionArn": arn}
@@ -10772,15 +10788,15 @@ def _firehose_delivery_stream_delete(physical_id, props):
 #     groups, users and user groups (#1874) ---
 # Each type goes through elasticache.py's own query-protocol functions, so a
 # stack's cluster or replication group gets the same container-backed endpoint
-# CreateCacheCluster / CreateReplicationGroup return. Create-only properties
-# follow the published registry schemas; every other property updates in
+# CreateCacheCluster / CreateReplicationGroup return. Replacement follows the
+# template reference's "Update requires"; every other property updates in
 # place through the matching Modify call, which, like the API, ignores the
 # members MiniStack does not model. Ref is the resource name for every type.
 
 # A cluster created while its image is still being pulled reports `creating`
 # and publishes its endpoint when the container starts; CloudFormation waits
 # for `available` before the resource completes.
-_EC_AVAILABLE_TIMEOUT = float(os.environ.get("MINISTACK_ELASTICACHE_CFN_WAIT", "300"))
+_EC_AVAILABLE_TIMEOUT = 300
 
 
 def _ec_query(props, renames=None):
@@ -10819,27 +10835,6 @@ def _ec_call(fn, params, resource_type, action):
 
 
 def _ec_sync_tags(arn, old_props, new_props, resource_type):
-# --- Glue Data Catalog, connections, crawlers, jobs and triggers (#1875) ---
-# Each type goes through glue.py's own control-plane functions, so a stack's
-# databases and tables are the catalog Athena and the Glue API read. Crawlers
-# and jobs are records only: a stack never starts a crawl or a job run. Ref
-# is the resource name for every type except the partition, whose Ref is its
-# compound primary identifier. Create-only properties follow the published
-# registry schemas. Deletes ignore EntityNotFound, since deleting a database
-# already drops its tables and partitions.
-
-
-def _glue_call(fn, data, resource_type, action):
-    status, _headers, body = fn(data)
-    if status >= 400:
-        raise ValueError(f"{resource_type} {action} failed: {body!r}")
-    return json.loads(body or b"{}")
-
-
-def _glue_sync_tags(arn, old_props, new_props, resource_type):
-    """Apply a Tags change through TagResource / UntagResource. The registry
-    schemas type Tags as a map, while the template reference pages say Tag
-    list; _tag_map reads both."""
     old_tags = _tag_map(old_props.get("Tags"))
     new_tags = _tag_map(new_props.get("Tags"))
     removed = sorted(old_tags.keys() - new_tags.keys())
@@ -10992,6 +10987,16 @@ def _ec_wait_available(records, record_id, status_key, resource_type):
     if rec is None or status == "create-failed":
         raise ValueError(f"{resource_type} {record_id} failed to start")
     return rec
+
+
+def _ec_cluster_requires_replacement(old, new):
+    # NumCacheNodes replaces when no Availability Zone was given before or now.
+    no_azs = not any(p.get(k) for p in (old, new)
+                     for k in ("PreferredAvailabilityZone", "PreferredAvailabilityZones"))
+    return (any(old.get(p) != new.get(p) for p in (
+                "Port", "SnapshotArns", "SnapshotName", "CacheSubnetGroupName",
+                "Engine", "NetworkType"))
+            or (no_azs and int(old.get("NumCacheNodes") or 1) != int(new.get("NumCacheNodes") or 1)))
 
 
 def _ec_cluster_attrs(cluster_id):
@@ -11232,6 +11237,33 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
 
 def _ec_user_group_delete(physical_id, props):
     _ec._delete_user_group({"UserGroupId": physical_id})
+
+
+# --- Glue Data Catalog, connections, crawlers, jobs and triggers (#1875) ---
+# Each type goes through glue.py's own control-plane functions, so a stack's
+# databases and tables are the catalog Athena and the Glue API read. Crawlers
+# and jobs are records only: a stack never starts a crawl or a job run. Ref
+# is the resource name for every type except the partition, whose Ref is its
+# compound primary identifier. Replacement follows the template reference's
+# "Update requires". Deletes ignore EntityNotFound, since deleting a database
+# already drops its tables and partitions.
+
+
+def _glue_call(fn, data, resource_type, action):
+    status, _headers, body = fn(data)
+    if status >= 400:
+        raise ValueError(f"{resource_type} {action} failed: {body!r}")
+    return json.loads(body or b"{}")
+
+
+def _glue_sync_tags(arn, old_props, new_props, resource_type):
+    """Apply a Tags change through TagResource / UntagResource. The registry
+    schemas type Tags as a map, while the template reference pages say Tag
+    list; _tag_map reads both."""
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    removed = sorted(old_tags.keys() - new_tags.keys())
+    if removed:
         _glue_call(_glue._untag_resource, {"ResourceArn": arn, "TagsToRemove": removed},
                    resource_type, "untag")
     if new_tags and new_tags != old_tags:
@@ -11265,16 +11297,16 @@ def _glue_database_create(logical_id, props, stack_name):
 
 
 def _glue_database_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    # The registry schema's only create-only property is DatabaseName, and its
-    # update handler is granted glue:UpdateDatabase but neither CreateDatabase
-    # nor DeleteDatabase: a DatabaseInput change, its Name included, updates
-    # the database in place under the same Ref.
     declared = new_props.get("DatabaseName")
     if physical_id not in _glue._databases or (declared and declared != physical_id):
         created = _glue_database_create(logical_id or physical_id, new_props, stack_name)
         if physical_id in _glue._databases and created[0] != physical_id:
             _delete_predecessor(_glue_database_delete, physical_id, old_props)
         return created
+    # AWS updates by the new DatabaseInput.Name, which does not exist yet.
+    requested = (new_props.get("DatabaseInput") or {}).get("Name")
+    if not declared and requested and requested.lower() != physical_id.lower():
+        raise ValueError(f"Database {requested} not found")
     name = physical_id
     db_input = _glue_database_input(name, new_props)
     db_input.update(_glue_reset_dropped(
@@ -12209,7 +12241,10 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
                       ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
                       ("Environment", "environment"), ("ServiceRole", "serviceRole")):
         if prop in new_props:
-            project[key] = new_props[prop]
+            value = new_props[prop]
+            if prop in ("Source", "Artifacts", "Environment"):
+                value = _codebuild_cfn_to_api(value)
+            project[key] = value
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
     _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
@@ -12393,7 +12428,6 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LayerName", "Content", "CompatibleRuntimes", "CompatibleArchitectures",
         "Description", "LicenseInfo",
     ),
-    # createOnlyProperties of the published registry schemas.
     "AWS::ElastiCache::SubnetGroup": ("CacheSubnetGroupName",),
     "AWS::ElastiCache::ParameterGroup": ("CacheParameterGroupFamily",),
     "AWS::ElastiCache::CacheCluster": (
@@ -12407,10 +12441,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     ),
     "AWS::ElastiCache::User": ("UserId", "UserName"),
     "AWS::ElastiCache::UserGroup": ("UserGroupId",),
-    # createOnlyProperties of the published registry schemas. Table,
-    # Partition and Connection are left out: the first replaces on a
-    # TableInput.Name change the schema does not list, and the other two have
-    # nested create-only members (PartitionInput/Values, ConnectionInput/Name).
+    # Table, Partition and Connection replace on nested members
+    # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
     "AWS::Glue::Database": ("DatabaseName",),
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
@@ -12421,9 +12453,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
 _CONDITIONALLY_REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("KeySchema",),
     "AWS::Lambda::Function": ("DurableConfig",),
-    # conditionalCreateOnlyProperties of the published registry schemas.
-    "AWS::ElastiCache::CacheCluster": ("PreferredAvailabilityZones", "IpDiscovery"),
-    "AWS::ElastiCache::ReplicationGroup": ("AuthToken", "NodeGroupConfiguration"),
+    "AWS::ElastiCache::CacheCluster": ("NumCacheNodes",),
+    "AWS::ElastiCache::ReplicationGroup": ("AuthToken", "NodeGroupConfiguration", "NumNodeGroups"),
 }
 
 
@@ -12488,6 +12519,7 @@ _RESOURCE_HANDLERS = {
         "update": _ec_user_group_update,
         "update_with_logical_id": True,
         "delete": _ec_user_group_delete,
+    },
     "AWS::Glue::Database": {
         "create": _glue_database_create,
         "update": _glue_database_update,

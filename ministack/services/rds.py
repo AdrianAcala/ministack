@@ -2551,8 +2551,8 @@ def _get_docker():
 
 
 def _in_container():
-    """Docker's and Podman's markers, as lambda_svc._running_in_container checks first."""
-    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+    from ministack.services.lambda_svc import _running_in_container
+    return _running_in_container()
 
 
 def _get_ministack_network(docker_client):
@@ -7803,7 +7803,7 @@ def _describe_global_clusters(p):
         gcs = snapshots
 
     members_xml = "".join(
-        f"<GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster>" for gc in gcs
+        f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
         f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")

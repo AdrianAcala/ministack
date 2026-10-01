@@ -5640,8 +5640,13 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             if not endpoint:
                 # Subprocess runs on the same host as ministack — point it at
                 # ourselves so boto3 calls land back here, not at real AWS.
+                from ministack.core import tls as _tls
+
                 gateway_port = os.environ.get("GATEWAY_PORT", "4566")
-                endpoint = f"http://{_MINISTACK_HOST}:{gateway_port}"
+                scheme = "https" if _tls.use_ssl_enabled() else "http"
+                endpoint = f"{scheme}://{_MINISTACK_HOST}:{gateway_port}"
+                if scheme == "https":
+                    _tls.trust_gateway_cert(env)
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
@@ -5760,6 +5765,11 @@ def _publish_version(name: str, data: dict):
             404,
         )
     func = _functions[name]
+    # "Lambda doesn't publish a version if the function's configuration and code
+    # haven't changed since the last version": the latest version comes back.
+    latest = max(func["versions"], key=int, default=None)
+    if latest and func["versions"][latest].get("function_revision") == func["config"].get("RevisionId"):
+        return json_response(func["versions"][latest]["config"], 201)
     ver_num = func["next_version"]
     func["next_version"] = ver_num + 1
 
