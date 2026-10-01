@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Lambda — Docker-executor functions reach a `USE_SSL=1` gateway** — the gateway listener serves only HTTPS, but a container's default `AWS_ENDPOINT_URL` was `http://host.docker.internal:<port>`, and its Node shim downgraded a function's `https.request` to the gateway to plain HTTP, which the listener resets. The default endpoint now follows the gateway's scheme and those requests keep TLS. With a gateway certificate that names `host.docker.internal` (`MINISTACK_SSL_CERT`/`MINISTACK_SSL_KEY`), whose CA MiniStack already mounts into these containers, SDK calls from a function succeed. Without `USE_SSL` nothing changes.
 
 - **RDS — `MINISTACK_RDS_PUBLIC_ENDPOINT=1` works with a Compose `hostname:`** — the #1884 fix told a containerised MiniStack from a host-run one by its `HOSTNAME` self-lookup, which a Compose `hostname:` defeats, so instances again stayed `creating`. MiniStack now checks Docker's or Podman's marker file for that, and a containerised MiniStack detects its network as with the setting off (`DOCKER_NETWORK`, then the self-lookup).
 ### Added
