@@ -18,6 +18,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — `AWS::Lambda::Version` updates `FunctionScalingConfig` in place** — a stack update re-ran the create, which published a new version for every change; a `FunctionScalingConfig` change now keeps the version, also when the update rolls back. Contributed by @iot-rocket.
 
 ### Fixed
+
+- **Step Functions — JSONPath Choice rules read execution context** — `Variable` and supported variable-to-variable comparison paths now resolve `$$.` against the context object, including inside `And`, `Or`, and `Not`. A Choice can check the original execution input after earlier states replace the current input.
 - **CloudFormation — `AWS::EC2::VPCGatewayAttachment` updates in place** — a changed `InternetGatewayId` or `VpnGatewayId` moves the attachment under the same `IGW|vpc-…` / `VGW|vpc-…` physical id, `VpnGatewayId` is attached at all, and a `VpcId` change leaves the gateway attached to the new VPC, or to the old one when the update rolls back.
 - **CloudFormation — `AWS::Lambda::Version` publishes through `PublishVersion`** — the version takes its `Description`, a version of a function unchanged since its latest version fails with the `AlreadyExists` error AWS reports, `FunctionScalingConfig` on a function without a capacity provider is refused, and a function keeps its `CapacityProviderConfig`. Contributed by @iot-rocket.
 - **AppConfig — hosted configuration version numbers are never reused** — a version created after a delete, and the replacement CloudFormation makes for a changed `HostedConfigurationVersion`, get the next unused number instead of overwriting the live one, and a `LatestVersionNumber` mismatch reports the AWS message.
