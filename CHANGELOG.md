@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway v2 (HTTP API) — an unmatched route answers AWS's exact 404 body** — a request with no matching route answered `{"message": "No route found"}`; AWS answers `{"message":"Not Found"}` (compact JSON, no space after the colon). REST API (v1) is unaffected — it already answers a route miss with its own `403 MISSING_AUTHENTICATION_TOKEN` gateway response, not this literal.
 - **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`.
 
 - **IoT — `DescribeEventConfigurations` and `UpdateEventConfigurations`** — both answered `Unsupported IoT path`; they now store the registry event switches per account and region, every type starting disabled, an update changing only the types it names, and `creationDate` / `lastModifiedDate` set from the first update on, as on AWS.
