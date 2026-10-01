@@ -298,41 +298,15 @@ def _parse_body(body) -> dict:
         return {}
 
 
-def _query_value(query_params, key, default=None):
+def _agentcore_query_value(query_params, key, default=None):
     value = (query_params or {}).get(key, default)
     if isinstance(value, list):
         return value[0] if value else default
     return value
 
 
-def _version_snapshot(runtime):
-    return {key: copy.deepcopy(value) for key, value in runtime.items()
-            if not key.startswith("_")}
-
-
-def _runtime_versions(runtime):
-    versions = runtime.get("_versions")
-    if versions:
-        return versions
-    current = runtime.get("agentRuntimeVersion", "1")
-    return {current: _version_snapshot(runtime)}
-
-
-def _version_summary(runtime, version):
-    snapshot = _runtime_versions(runtime)[version]
-    return {
-        "agentRuntimeArn": runtime["agentRuntimeArn"],
-        "agentRuntimeId": runtime["agentRuntimeId"],
-        "agentRuntimeVersion": version,
-        "agentRuntimeName": snapshot["agentRuntimeName"],
-        "description": snapshot.get("description", ""),
-        "lastUpdatedAt": _iso(snapshot["lastUpdatedAt"]),
-        "status": snapshot["status"],
-    }
-
-
-def _paginate(items, query_params):
-    raw_limit = _query_value(query_params, "maxResults", "10")
+def _paginate_agentcore_results(items, query_params):
+    raw_limit = _agentcore_query_value(query_params, "maxResults", "10")
     try:
         limit = int(raw_limit)
     except (TypeError, ValueError):
@@ -340,23 +314,28 @@ def _paginate(items, query_params):
     if not 1 <= limit <= 100:
         return None, _validation("maxResults must be an integer from 1 to 100")
 
-    token = _query_value(query_params, "nextToken")
+    token = _agentcore_query_value(query_params, "nextToken")
     offset = 0
-    if token:
+    if token is not None:
+        if not isinstance(token, str) or not token or len(token) > 2048:
+            return None, _validation("nextToken is invalid")
         try:
             padded = token + "=" * (-len(token) % 4)
-            offset = int(base64.urlsafe_b64decode(padded.encode()).decode())
+            token_bytes = base64.b64decode(
+                padded.encode(), altchars=b"-_", validate=True
+            )
+            offset = int(token_bytes.decode())
             if offset < 0:
                 raise ValueError
         except (ValueError, TypeError, base64.binascii.Error):
             return None, _validation("nextToken is invalid")
 
-    result = {"items": items[offset:offset + limit]}
+    page = {"items": items[offset:offset + limit]}
     if offset + limit < len(items):
-        result["nextToken"] = base64.urlsafe_b64encode(
+        page["nextToken"] = base64.urlsafe_b64encode(
             str(offset + limit).encode()
         ).decode().rstrip("=")
-    return result, None
+    return page, None
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +411,7 @@ def _get_agent_runtime(runtime_id, query_params=None):
     return json_response(out)
 
 
-def _list_agent_runtimes(body):
+def _list_agent_runtimes(query_params):
     summaries = []
     for r in _runtimes.values():
         summaries.append({
@@ -444,7 +423,13 @@ def _list_agent_runtimes(body):
             "lastUpdatedAt": _iso(r["lastUpdatedAt"]),
             "status": r["status"],
         })
-    return json_response({"agentRuntimes": summaries})
+    page, error = _paginate_agentcore_results(summaries, query_params)
+    if error:
+        return error
+    return json_response({
+        "agentRuntimes": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
 def _list_agent_runtime_versions(runtime_id, query_params):
@@ -574,7 +559,7 @@ def _get_agent_runtime_endpoint(runtime_id, endpoint_name):
     })
 
 
-def _list_agent_runtime_endpoints(runtime_id, body):
+def _list_agent_runtime_endpoints(runtime_id, query_params):
     if _runtimes.get(runtime_id) is None:
         return _not_found(f"Agent runtime {runtime_id} not found")
     endpoints = _endpoints.get(runtime_id) or {}
@@ -592,7 +577,13 @@ def _list_agent_runtime_endpoints(runtime_id, body):
             "createdAt": _iso(record["createdAt"]),
             "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
         })
-    return json_response({"runtimeEndpoints": items})
+    page, error = _paginate_agentcore_results(items, query_params)
+    if error:
+        return error
+    return json_response({
+        "runtimeEndpoints": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
 def _update_agent_runtime_endpoint(runtime_id, endpoint_name, body):
@@ -1079,7 +1070,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "PUT":
             return _create_agent_runtime(body)
         if method == "POST":
-            return _list_agent_runtimes(body)
+            return _list_agent_runtimes(query_params)
     elif n == 2:
         runtime_id = unquote(parts[1])
         if method == "GET":
@@ -1101,7 +1092,7 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PUT":
                 return _create_agent_runtime_endpoint(runtime_id, body)
             if method == "POST":
-                return _list_agent_runtime_endpoints(runtime_id, body)
+                return _list_agent_runtime_endpoints(runtime_id, query_params)
     elif n == 4 and parts[2] == "runtime-endpoints":
         runtime_id = unquote(parts[1])
         endpoint_name = unquote(parts[3])
