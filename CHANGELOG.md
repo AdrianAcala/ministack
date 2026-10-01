@@ -7,8 +7,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **CloudFormation — `AWS::Lambda::Version` updates `FunctionScalingConfig` in place** — a stack update re-ran the create, which published a new version for every change; a `FunctionScalingConfig` change now keeps the version, also when the update rolls back. Contributed by @iot-rocket.
+
 ### Fixed
 - **CloudFormation — `AWS::EC2::VPCGatewayAttachment` updates in place** — a changed `InternetGatewayId` or `VpnGatewayId` moves the attachment under the same `IGW|vpc-…` / `VGW|vpc-…` physical id, `VpnGatewayId` is attached at all, and a `VpcId` change leaves the gateway attached to the new VPC, or to the old one when the update rolls back.
+- **CloudFormation — `AWS::Lambda::Version` publishes through `PublishVersion`** — the version takes its `Description`, a version of a function unchanged since its latest version fails with the `AlreadyExists` error AWS reports, `FunctionScalingConfig` on a function without a capacity provider is refused, and a function keeps its `CapacityProviderConfig`. Contributed by @iot-rocket.
 
 - **SESv2 — `CreateEmailIdentity`/`GetEmailIdentity` return Easy DKIM tokens for a DOMAIN identity** — a domain identity created without `DkimSigningAttributes` answered an empty `Tokens` list with `Status: NOT_STARTED`. AWS provides a set of DKIM tokens for its CNAME records in that case (Easy DKIM), so the Terraform `aws_sesv2_email_identity` resource's `dkim_signing_attributes[0].tokens` indexing failed. A DOMAIN identity now gets three tokens, `SigningAttributesOrigin: AWS_SES` and `Status: PENDING`, unless `DkimSigningAttributes` brings its own key (BYODKIM); EMAIL_ADDRESS identities are unchanged.
 - **API Gateway v2 (HTTP API) — a missing identity source is a 401 without caching too** — a REQUEST authorizer's short circuit for a declared identity source missing from the request only fired with `authorizerResultTtlInSeconds` caching on; with caching off the authorizer was invoked. AWS answers `401 {"message":"Unauthorized"}` (compact JSON) without invoking it either way, as observed on a deployed HTTP API with a TTL of 0. `$context.*` identity sources, which MiniStack does not model, do not count as missing without caching.
