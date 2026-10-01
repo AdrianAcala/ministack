@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **RDS — `MINISTACK_RDS_PUBLIC_ENDPOINT=1` works with a Compose `hostname:`** — the #1884 fix told a containerised MiniStack from a host-run one by its `HOSTNAME` self-lookup, which a Compose `hostname:` defeats, so instances again stayed `creating`. MiniStack now checks Docker's or Podman's marker file for that, and a containerised MiniStack detects its network as with the setting off (`DOCKER_NETWORK`, then the self-lookup).
 ### Added
 
 - **IoT — registry events** — with a type enabled through `UpdateEventConfigurations`, the thing, thing type, thing type association, thing group, thing group hierarchy and thing group membership operations publish the AWS payload to `$aws/events/...`, where MQTT subscribers and topic rules receive it.
