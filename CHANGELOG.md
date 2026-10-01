@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **SQS — `QueueUrl` matches the gateway's TLS scheme (`USE_SSL=1`)** — `CreateQueue`/`GetQueueUrl`/`ListQueues` always returned `http://` URLs, and the AWS SDK v3 uses the QueueUrl itself as the request endpoint (`useQueueUrlAsEndpoint` defaults true), so a client handed that URL left the TLS-only gateway. The `AWS::SQS::Queue` CloudFormation provisioner built the same hardcoded scheme and now reuses the shared helper.
 - **API Gateway v2 (HTTP API) — an unmatched route answers AWS's exact 404 body** — a request with no matching route answered `{"message": "No route found"}`; AWS answers `{"message":"Not Found"}` (compact JSON, no space after the colon). REST API (v1) is unaffected — it already answers a route miss with its own `403 MISSING_AUTHENTICATION_TOKEN` gateway response, not this literal.
 - **API Gateway v2 — `apiEndpoint` follows the gateway's TLS scheme** — with `USE_SSL=1` the gateway listener serves only HTTPS, but CreateApi and the `AWS::ApiGatewayV2::Api` CloudFormation resource always returned an `http://` `apiEndpoint`, which nothing answers. They now return `https://`, or `wss://` for a WebSocket API, as AWS does. Without `USE_SSL` the endpoint keeps `http://`.
 
