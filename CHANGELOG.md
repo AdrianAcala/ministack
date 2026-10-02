@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudFormation — change sets list what a change reaches** — a resource that references a replaced resource, an attribute of a modified resource or a changed parameter is now listed as a `Modify` whose detail names the cause (`ChangeSource` `ResourceReference`, `ResourceAttribute` or `ParameterReference`, with `CausingEntity`). Contributed by @iot-rocket.
 - **ECS — `DescribeClusters` statistics** — `include=["STATISTICS"]` returns the sixteen running/pending task and active/draining service counters per launch type instead of an empty list.
 - **ECS — `DescribeClusters` honours `include`** — `settings` and `tags` come back empty and `attachments` and `configuration` are left out unless requested, `CreateCluster` keeps `configuration`, and a CloudFormation cluster reports its tags and the default `containerInsights` setting.
 - **ECS — `DescribeClusters` honours `include`** — `settings` and `tags` come back empty and `attachments` and `configuration` are left out unless requested, `CreateCluster` keeps `configuration`, and a CloudFormation cluster reports its tags and the default `containerInsights` setting.
