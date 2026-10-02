@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **ECS — forced rolling deployments replace tasks and refresh images** — `UpdateService(forceNewDeployment=True)` replaces tasks even when the task definition is unchanged or omitted. Rolling deployments preserve scheduling limits, wait for replacement tasks to stabilize, and retain circuit-breaker rollback; zero-sized deployments drain old tasks and complete. Docker-backed services pin image digests per deployment, honor `versionConsistency: disabled`, and use Secrets Manager credentials for private registries. Tasks report resolved image digests and Fargate platform fields. Cached images remain usable on both launch types, including MiniStack ECR images, preserving MiniStack’s intentional offline fallback.
+
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
