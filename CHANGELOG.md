@@ -9,6 +9,11 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CloudFormation — `Capabilities` check without `AUTH`** — `CFN_ENFORCE_CAPABILITIES=1` refuses a template whose IAM resources or macros the request does not acknowledge also without `AUTH=true`, as AWS always does.
+
+### Fixed
+
+- **CloudFormation — nested stack with a `Transform`** — where `Capabilities` are checked, a nested stack whose template declares a `Transform` or calls `Fn::Transform` fails with `Requires capabilities : [CAPABILITY_AUTO_EXPAND]` unless the parent acknowledged `CAPABILITY_AUTO_EXPAND`, as on AWS.
 - **CloudFormation — `AWS::RDS::DBCluster` and `AWS::RDS::DBInstance` update in place** — a stack update re-ran the create, which gave the resource a new endpoint, resource id and create time and emptied the cluster's member list; the properties the create stores now change on the existing record, a create-only or `Engine` change replaces the resource or, under a custom identifier, is refused, a cluster `MasterUsername` change leaves the cluster as it is, change sets report which properties replace, and a stack-created cluster can now be described and answers `Fn::GetAtt DBClusterResourceId`. Contributed by @iot-rocket.
 - **CloudFormation — `AWS::Pipes::Pipe` and `AWS::Scheduler::ScheduleGroup` update in place** — a pipe keeps its stream position and `CreationTime` when `Description`, `Target`, `RoleArn`, `DesiredState` or `Tags` change, gets `Description` and `Tags` on create and refuses a create-only source change under an explicit `Name`, and a schedule group takes template and stack tag changes while keeping tags added through `TagResource`.
 - **CloudFormation — EKS cluster and node group updates** — `AWS::EKS::Cluster` applies `Version`, `Logging`, `ResourcesVpcConfig`, `AccessConfig.AuthenticationMode` and `Tags` in place and `AWS::EKS::Nodegroup` applies `ScalingConfig`, `Labels`, `Taints`, `UpdateConfig`, `LaunchTemplate`, `Version`, `ReleaseVersion` and `Tags`, where every such change used to report `UPDATE_COMPLETE` and was dropped.
