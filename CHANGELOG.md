@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CloudFormation — `IMPORT` change sets execute** — existing SQS queues, SSM parameters, S3 buckets, DynamoDB tables, IAM roles, log groups, Lambda functions, IoT policies, IoT CA certificates and Cognito user pools are adopted into a new or existing stack without being changed (`IMPORT_IN_PROGRESS` to `IMPORT_COMPLETE`, or a rollback when a resource is gone), and an import that changes `Outputs` or stack tags is refused, as on AWS.
 - **CloudFormation — `Capabilities` check without `AUTH`** — `CFN_ENFORCE_CAPABILITIES=1` refuses a template whose IAM resources or macros the request does not acknowledge also without `AUTH=true`, as AWS always does.
 
 ### Fixed
