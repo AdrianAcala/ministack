@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CloudFormation — EKS cluster and node group updates** — `AWS::EKS::Cluster` applies `Version`, `Logging`, `ResourcesVpcConfig`, `AccessConfig.AuthenticationMode` and `Tags` in place and `AWS::EKS::Nodegroup` applies `ScalingConfig`, `Labels`, `Taints`, `UpdateConfig`, `LaunchTemplate`, `Version`, `ReleaseVersion` and `Tags`, where every such change used to report `UPDATE_COMPLETE` and was dropped.
 - **SES — a sandboxed account sends only to verified or simulator recipients** — SES v2 `PutAccountDetails` with `ProductionAccessEnabled=false` puts the account (per region) in the sandbox, as on AWS, and `GetAccount` reports it with the submitted `Details`. A sandboxed send to a recipient that is neither a verified address or domain identity nor a `@simulator.amazonses.com` address fails with `MessageRejected` "Email address is not verified. The following identities failed the check in region …" for v1 `SendEmail`, `SendRawEmail` and `SendTemplatedEmail` and v2 `SendEmail`; bulk sends reject only the affected entries. Accounts stay in production by default. Reported by @skialpine.
 
 ### Fixed
