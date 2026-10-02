@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **ECS — `DescribeClusters` statistics** — `include=["STATISTICS"]` returns the sixteen running/pending task and active/draining service counters per launch type instead of an empty list.
+- **ECS — `DescribeClusters` honours `include`** — `settings` and `tags` come back empty and `attachments` and `configuration` are left out unless requested, `CreateCluster` keeps `configuration`, and a CloudFormation cluster reports its tags and the default `containerInsights` setting.
 - **ECS — `DescribeClusters` honours `include`** — `settings` and `tags` come back empty and `attachments` and `configuration` are left out unless requested, `CreateCluster` keeps `configuration`, and a CloudFormation cluster reports its tags and the default `containerInsights` setting.
 - **CloudFormation — `AWS::S3::MultiRegionAccessPoint` and `AWS::AutoScaling::LaunchConfiguration` are replaced on update** — every property of both types is create-only, so a change now creates the resource under a new generated name and deletes the old one after the update (a `Regions` change was dropped and the stack reported the alias as the physical id, a launch configuration was overwritten under its old name), fails with the custom-named-resource error when the name is explicit, and is reported as `Replacement: True` in a change set.
 - **CloudFormation — `AWS::SQS::Queue` with `FifoQueue` gets a generated `.fifo` name** — `FifoQueue: true` without a `QueueName` creates a FIFO queue with a generated `.fifo` name instead of a standard queue, and a `QueueName` whose `.fifo` suffix disagrees with `FifoQueue` fails the resource. Contributed by @iot-rocket.
