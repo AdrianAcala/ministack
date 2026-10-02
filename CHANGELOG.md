@@ -8,6 +8,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **API Gateway v2 (WebSocket API) — `$connect` authorization** — a `CUSTOM` `$connect` route ran no authorizer. It now runs its REQUEST authorizer, refuses the handshake with 401, 403 or 500 and passes `principalId` and the context to `requestContext.authorizer` of the connection's events. `CreateAuthorizer`, `CreateRoute`, `UpdateRoute` and the CloudFormation resources refuse a JWT authorizer, JWT route authorization and authorization on a route other than `$connect` with `BadRequestException`, as AWS does; a JWT `$connect` route kept in saved state refuses the handshake with 500 instead of validating the token. `requestContext.stage` names the stage in the connection URL instead of `$default`.
+
 
 - **CloudFormation — a change set with only new stack tags lists them** — it ended `FAILED` with "didn't contain changes"; it now lists each resource the stack holds, other than a custom resource or wait condition, as a `Modify` with `Scope: Tags`, and stack tags given in another order are no change for a change set or `UpdateStack`. Contributed by @iot-rocket.
 - **CloudFormation — change sets list what a change reaches** — a resource that references a replaced resource, an attribute of a modified resource or a changed parameter is now listed as a `Modify` whose detail names the cause (`ChangeSource` `ResourceReference`, `ResourceAttribute` or `ParameterReference`, with `CausingEntity`). Contributed by @iot-rocket.
