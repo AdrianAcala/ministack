@@ -52,6 +52,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **CloudFormation — `AWS::SQS::Queue` with `FifoQueue` gets a generated `.fifo` name** — `FifoQueue: true` without a `QueueName` creates a FIFO queue with a generated `.fifo` name instead of a standard queue, and a `QueueName` whose `.fifo` suffix disagrees with `FifoQueue` fails the resource. Contributed by @iot-rocket.
 - **CloudFormation — nested stack with a `Transform`** — under `AUTH=true`, a nested stack whose template declares a `Transform` or calls `Fn::Transform` fails with `Requires capabilities : [CAPABILITY_AUTO_EXPAND]` unless the parent acknowledged `CAPABILITY_AUTO_EXPAND`, as on AWS. Contributed by @iot-rocket.
 
+### Fixed
+
+- **CloudFormation — `Fn::Select` in a condition** — a condition that checks one member of a `CommaDelimitedList`, such as `!Not [!Equals [!Select [2, !Ref KeySpec], ""]]`, was always true, whatever the parameter value. Templates use this check for an optional member: `"id,S,,"` gives `["id", "S", "", ""]`, and an empty member means "no value". Conditions did not resolve `Fn::Select`, so `Fn::Equals` compared the unresolved function with `""`. Thus the stack made resources whose condition is false, and `Fn::If` took the wrong branch. Conditions now resolve `Fn::Select`, with the same comma split as resource properties. Contributed by @mishukdutta-cz.
+
 ## [1.5.20] — 2026-10-01
 
 ### Added
