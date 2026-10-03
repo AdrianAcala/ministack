@@ -3845,6 +3845,16 @@ def _docker_cp_dir(container, src_dir: str, dest_dir: str, arcname: str = "."):
     container.put_archive(dest_dir, buf)
 
 
+def _docker_cp_file(container, src_path: str, dest_path: str):
+    """Copy one local file (symlinks followed) into a container at ``dest_path``."""
+    import tarfile
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", dereference=True) as tar:
+        tar.add(src_path, arcname=dest_path.lstrip("/"))
+    buf.seek(0)
+    container.put_archive("/", buf)
+
+
 # Bare-text body the RIE answers with (HTTP 200) when a run hits the function
 # timeout (#1845); it is not a JSON error payload.
 _RIE_TIMEOUT_TEXT_RE = re.compile(r"Task timed out after \d+\.\d\d seconds")
@@ -4119,8 +4129,11 @@ _CONTAINER_BUNDLE_PATH = "/var/ministack/ca-bundle.pem"
 _CONTAINER_TRUSTSTORE_PATH = "/var/ministack/truststore.p12"
 
 
-def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
-    """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert."""
+def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", copies=None):
+    """Under USE_SSL=1, resolve the Cognito issuer hosts to the gateway and trust its cert.
+
+    With ``copies`` (MiniStack in a container) the trust files are listed for docker cp, not bind-mounted.
+    """
     from ministack.core import tls as _tls
 
     if not _tls.use_ssl_enabled():
@@ -4136,20 +4149,24 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime=""):
         return
     # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
     bundle = _tls.ca_bundle_path(cert_path)
-    mounts.append(docker_lib.types.Mount(
-        _CONTAINER_CA_PATH, cert_path, type="bind", read_only=True))
+
+    def trust(target, source):
+        if copies is not None:
+            copies.append((target, source))
+        else:
+            mounts.append(docker_lib.types.Mount(target, source, type="bind", read_only=True))
+
+    trust(_CONTAINER_CA_PATH, cert_path)
     container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
     if bundle:
-        mounts.append(docker_lib.types.Mount(
-            _CONTAINER_BUNDLE_PATH, bundle, type="bind", read_only=True))
+        trust(_CONTAINER_BUNDLE_PATH, bundle)
         for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
             container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
     # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
     if runtime.startswith("java"):
         store = _tls.java_truststore_path(cert_path)
         if store:
-            mounts.append(docker_lib.types.Mount(
-                _CONTAINER_TRUSTSTORE_PATH, store, type="bind", read_only=True))
+            trust(_CONTAINER_TRUSTSTORE_PATH, store)
             container_env.setdefault("JAVA_TOOL_OPTIONS", " ".join((
                 f"-Djavax.net.ssl.trustStore={_CONTAINER_TRUSTSTORE_PATH}",
                 "-Djavax.net.ssl.trustStoreType=pkcs12",
@@ -4208,7 +4225,7 @@ def handler(event, context):
 
 _JS_CTX_ARN_SHIM = '''\
 // MiniStack shim: hand user code the control-plane ARN in its context, and
-// reach the gateway over plain HTTP when a library insists on HTTPS.
+// reach the gateway over plain HTTP (without USE_SSL) when a library insists on HTTPS.
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
@@ -4216,7 +4233,7 @@ const https = require("https");
 const REAL = process.env._MS_REAL_HANDLER || "index.handler";
 const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
 const TASK_ROOT = process.env.LAMBDA_TASK_ROOT || "/var/task";
-// The container talks to MiniStack over http://<gateway host>:<port>, but the
+// Without USE_SSL the container talks to MiniStack over http://<gateway host>:<port>, but the
 // response submitters the CDK bundles into its custom-resource handlers
 // (nodejs-entrypoint, the provider framework, AwsCustomResource) build the
 // ResponseURL PUT from the URL's hostname and path only and hand it to
@@ -4258,6 +4275,8 @@ try {
     if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
       return origHttpsRequest.apply(https, original);
     }
+    // USE_SSL: the gateway serves only HTTPS, so a request to it keeps TLS.
+    if (EP.protocol === "https:") return origHttpsRequest.apply(https, original);
     opts.protocol = "http:";
     opts.hostname = host;
     opts.host = host + ":" + EP_PORT;
@@ -4465,8 +4484,11 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
     if not endpoint:
+        from ministack.core import tls as _tls
+
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        endpoint = f"http://host.docker.internal:{port}"
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        endpoint = f"{scheme}://host.docker.internal:{port}"
     else:
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
@@ -4535,7 +4557,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             container_env["_MS_REAL_HANDLER"] = handler
             run_kwargs["command"] = [shim_cmd]
 
-    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime)
+    trust_copies = [] if _running_in_container() else None
+    _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime, trust_copies)
 
     if mounts:
         run_kwargs["mounts"] = mounts
@@ -4610,7 +4633,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
     try:
-        if _use_docker_cp or _cp_layers:
+        if _use_docker_cp or _cp_layers or trust_copies:
             create_kwargs = {k: v for k, v in run_kwargs.items()
                              if k not in ("detach", "stdin_open")}
             container = client.containers.create(**create_kwargs)
@@ -4627,6 +4650,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             # layer ordering. Fixes issue #888.
             for ld in layers_dirs:
                 _docker_cp_dir(container, ld, "/opt", arcname=".")
+            for target, source in trust_copies or ():
+                _docker_cp_file(container, source, target)
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
@@ -5635,8 +5660,13 @@ def _execute_function_local(func: dict, event: dict) -> dict:
             if not endpoint:
                 # Subprocess runs on the same host as ministack — point it at
                 # ourselves so boto3 calls land back here, not at real AWS.
+                from ministack.core import tls as _tls
+
                 gateway_port = os.environ.get("GATEWAY_PORT", "4566")
-                endpoint = f"http://{_MINISTACK_HOST}:{gateway_port}"
+                scheme = "https" if _tls.use_ssl_enabled() else "http"
+                endpoint = f"{scheme}://{_MINISTACK_HOST}:{gateway_port}"
+                if scheme == "https":
+                    _tls.trust_gateway_cert(env)
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
@@ -5656,6 +5686,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 text=True,
                 timeout=timeout,
                 env=env,
+                cwd=code_dir,
             )
 
             log_tail = proc.stderr.strip()
@@ -5755,6 +5786,11 @@ def _publish_version(name: str, data: dict):
             404,
         )
     func = _functions[name]
+    # "Lambda doesn't publish a version if the function's configuration and code
+    # haven't changed since the last version": the latest version comes back.
+    latest = max(func["versions"], key=int, default=None)
+    if latest and func["versions"][latest].get("function_revision") == func["config"].get("RevisionId"):
+        return json_response(func["versions"][latest]["config"], 201)
     ver_num = func["next_version"]
     func["next_version"] = ver_num + 1
 
@@ -5768,6 +5804,7 @@ def _publish_version(name: str, data: dict):
     ver_record = {
         "config": ver_config,
         "code_zip": func.get("code_zip"),
+        "function_revision": func["config"].get("RevisionId"),
     }
     func["versions"][str(ver_num)] = ver_record
     if _stamp_snapstart_published_version(ver_config):

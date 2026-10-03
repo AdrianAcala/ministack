@@ -14,7 +14,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DeleteDBClusterParameterGroup, DescribeDBClusterParameters,
           ModifyDBClusterParameterGroup, ResetDBClusterParameterGroup,
           CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
-          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DeleteDBClusterSnapshot,
+          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DescribeDBClusterSnapshotAttributes,
+          DeleteDBClusterSnapshot,
           CreateOptionGroup, DeleteOptionGroup, DescribeOptionGroups, DescribeOptionGroupOptions,
           CreateDBInstanceReadReplica (stub), RestoreDBInstanceFromDBSnapshot (stub),
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
@@ -2550,18 +2551,27 @@ def _get_docker():
     return _docker
 
 
+def _in_container():
+    from ministack.services.lambda_svc import _running_in_container
+    return _running_in_container()
+
+
 def _get_ministack_network(docker_client):
     """Detect the Docker network MiniStack is running on (if containerised).
 
-    Under MINISTACK_RDS_PUBLIC_ENDPOINT the database containers join the
-    network only when MiniStack itself is containerised, so readiness and
-    internal wiring can reach them while _reported_endpoint reports the
-    published port.
+    Under MINISTACK_RDS_PUBLIC_ENDPOINT a host-run MiniStack keeps its
+    database containers off the network, since it cannot reach their
+    addresses; a containerised one detects its network as usual, so
+    readiness and internal wiring reach them while _reported_endpoint
+    reports the published port.
     """
     global _ministack_network
     if _ministack_network is not None:
         return _ministack_network or None
-    if DOCKER_NETWORK and not RDS_PUBLIC_ENDPOINT:
+    if RDS_PUBLIC_ENDPOINT and not _in_container():
+        _ministack_network = ""
+        return None
+    if DOCKER_NETWORK:
         _ministack_network = DOCKER_NETWORK
         logger.debug("RDS: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
         return DOCKER_NETWORK
@@ -2571,8 +2581,7 @@ def _get_ministack_network(docker_client):
         nets = list(
             self_container.attrs["NetworkSettings"]["Networks"].keys())
         if nets:
-            _ministack_network = (DOCKER_NETWORK if DOCKER_NETWORK in nets
-                                  else nets[0])
+            _ministack_network = nets[0]
             logger.debug("RDS: detected MiniStack network: %s",
                          _ministack_network)
             return _ministack_network
@@ -6775,6 +6784,24 @@ def _describe_db_cluster_snapshots(p):
         f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
 
 
+def _describe_db_cluster_snapshot_attributes(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    if not snap_id or snap_id not in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotNotFoundFault",
+            f"DB cluster snapshot {snap_id} not found.", 404)
+    # Never shared: ModifyDBClusterSnapshotAttribute is not implemented.
+    result = (
+        f"<DBClusterSnapshotAttributesResult>"
+        f"<DBClusterSnapshotIdentifier>{_esc(snap_id)}</DBClusterSnapshotIdentifier>"
+        f"<DBClusterSnapshotAttributes>"
+        f"<DBClusterSnapshotAttribute><AttributeName>restore</AttributeName><AttributeValues></AttributeValues></DBClusterSnapshotAttribute>"
+        f"</DBClusterSnapshotAttributes>"
+        f"</DBClusterSnapshotAttributesResult>"
+    )
+    return _xml(200, "DescribeDBClusterSnapshotAttributesResponse",
+        f"<DescribeDBClusterSnapshotAttributesResult>{result}</DescribeDBClusterSnapshotAttributesResult>")
+
+
 def _delete_db_cluster_snapshot(p):
     snap_id = _p(p, "DBClusterSnapshotIdentifier")
     snap = _db_cluster_snapshots.pop(snap_id, None)
@@ -7795,7 +7822,7 @@ def _describe_global_clusters(p):
         gcs = snapshots
 
     members_xml = "".join(
-        f"<GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster>" for gc in gcs
+        f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
         f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")
@@ -11093,6 +11120,7 @@ _ACTION_MAP = {
     "DescribeDBSnapshots": _describe_db_snapshots,
     "CreateDBClusterSnapshot": _create_db_cluster_snapshot,
     "DescribeDBClusterSnapshots": _describe_db_cluster_snapshots,
+    "DescribeDBClusterSnapshotAttributes": _describe_db_cluster_snapshot_attributes,
     "DeleteDBClusterSnapshot": _delete_db_cluster_snapshot,
     "CreateDBSubnetGroup": _create_subnet_group,
     "DeleteDBSubnetGroup": _delete_subnet_group,

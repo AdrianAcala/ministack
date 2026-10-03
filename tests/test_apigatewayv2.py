@@ -1025,6 +1025,18 @@ def test_apigw_execute_no_route(apigw):
     except _urlerr.HTTPError as e:
         assert e.code == 404
         assert e.read() == b'{"message":"Not Found"}'
+    # No stage matches and there is no $default stage: the same body.
+    staged = apigw.create_api(Name="no-stage-api", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=staged, StageName="prod")
+    req = _urlreq.Request(f"http://{staged}.execute-api.localhost:{_EXECUTE_PORT}/dev/x", method="GET")
+    req.add_header("Host", f"{staged}.execute-api.localhost:{_EXECUTE_PORT}")
+    try:
+        _urlreq.urlopen(req)
+        assert False, "Expected 404"
+    except _urlerr.HTTPError as e:
+        assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
+    apigw.delete_api(ApiId=staged)
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
@@ -1101,6 +1113,44 @@ def test_apigw_path_param_route(apigw, lam):
     assert resp.status == 200
     body = json.loads(resp.read())
     assert body["rawPath"] == "/items/abc123"
+
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_leading_double_slash_selects_route(apigw, lam):
+    """A doubled leading slash still selects the route, as on AWS."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-dbl-slash-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    api_id = apigw.create_api(Name=f"dbl-slash-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="ANY /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    resp = _urlreq.urlopen(f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/$default//items/abc123")
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"proxy": "abc123"}
 
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
@@ -1326,6 +1376,47 @@ def test_apigw_raw_query_string_percent_encoded(apigw, lam):
         body = json.loads(resp.read())
         assert "openid%20profile" in body["rawQs"]
         assert "openid profile" not in body["rawQs"]  # no literal space
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_raw_path_keeps_percent25_escape(apigw, lam):
+    """rawPath decodes escapes but never %25, so a%252Eb is not turned into a%2Eb."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-rawpath-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'rawPath': event.get('rawPath')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"rawpath-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    def raw_path(segment):
+        req = _urlreq.Request(f"http://{host}/$default/items/{segment}", method="GET")
+        req.add_header("Host", host)
+        return json.loads(_urlreq.urlopen(req).read())["rawPath"]
+
+    try:
+        assert raw_path("a%252Eb") == "/items/a%252Eb"
+        assert raw_path("a%2Eb") == "/items/a.b"
+        req = _urlreq.Request(f"http://{host}/items/a%252Eb", method="GET")
+        req.add_header("Host", host)
+        assert json.loads(_urlreq.urlopen(req).read())["rawPath"] == "/items/a%252Eb"
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=fname)
@@ -2963,51 +3054,200 @@ def test_apigwv2_path_based_websocket(apigw, lam):
         ws.close()
 
 
-def test_ws_connect_jwt_authorizer_rejects_missing_token(apigw, lam, cognito_idp):
-    """$connect with a JWT authorizer rejects connections that lack a valid token (#1074)."""
+_WS_CONTEXT_CODE = """
+import json
+def handler(event, context):
+    rc = event['requestContext']
+    return {'statusCode': 200, 'body': json.dumps({'stage': rc['stage'], 'authorizer': rc.get('authorizer')})}
+"""
 
-    pool_id = cognito_idp.create_user_pool(PoolName=f"ws-jwt-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
-    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
-    api = apigw.create_api(Name=f"ws-jwt-deny-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")
-    api_id = api["ApiId"]
 
-    fn_name = f"ws-jwt-con-{_uuid_mod.uuid4().hex[:6]}"
-    arn = _make_fn(lam, fn_name, _ECHO_CODE)
-    integ = apigw.create_integration(
-        ApiId=api_id, IntegrationType="AWS_PROXY",
-        IntegrationUri=arn, IntegrationMethod="POST",
-    )
+@pytest.mark.parametrize("path_based", [False, True], ids=["host", "path"])
+def test_ws_request_context_names_the_stage(apigw, lam, path_based):
+    """requestContext.stage is the stage named in the connection URL."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"stage-{uuid.uuid4().hex[:6]}",
+                             default_code=_WS_CONTEXT_CODE)
+    if path_based:
+        path, host = f"/_aws/execute-api/{api_id}/prod", f"localhost:{_EXECUTE_PORT}"
+    else:
+        path, host = "/prod", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    ws = _WSClient("localhost", _EXECUTE_PORT, path, headers={"Host": host})
+    try:
+        ws.send(json.dumps({"action": "x"}))
+        assert json.loads(ws.recv())["stage"] == "prod"
+    finally:
+        ws.close()
+
+
+_WS_AUTHORIZER_CODE = """
+def handler(event, context):
+    tok = {k.lower(): v for k, v in event['headers'].items()}.get('auth', '')
+    if tok == 'error':
+        raise Exception('authorizer failed')
+    arn = event['methodArn']
+    return {
+        'principalId': 'alice',
+        'policyDocument': {'Version': '2012-10-17', 'Statement': [{
+            'Action': 'execute-api:Invoke', 'Resource': arn.replace('/prod/', '/other/') if tok == 'other' else arn,
+            'Effect': 'Allow' if tok in ('allow', 'other') else 'Deny'}]},
+        'context': {'user': 'alice', 'n': 7, 'ok': True, 'methodArn': arn, 'type': event['type'],
+                    'eventType': event['requestContext']['eventType'],
+                    'requestId': event['requestContext']['requestId']},
+    }
+"""
+
+_WS_CONNECT_NEEDS_AUTHORIZER_CODE = """
+def handler(event, context):
+    rc = event['requestContext']
+    authorizer = rc.get('authorizer') or {}
+    same_request = authorizer.get('requestId') == rc['requestId']
+    return {'statusCode': 200 if authorizer.get('user') == 'alice' and same_request else 403}
+"""
+
+
+def _wire_ws_request_authorizer_api(apigw, lam,
+                                    identity_source=("route.request.header.Auth", "route.request.querystring.tok")):
+    """WS API whose $connect route uses a REQUEST authorizer, by default on header Auth + querystring tok."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"reqauth-{uuid.uuid4().hex[:6]}",
+                             connect_code=_WS_CONNECT_NEEDS_AUTHORIZER_CODE, default_code=_WS_CONTEXT_CODE)
+    fn_arn = _make_fn(lam, f"ws-reqauth-authorizer-{uuid.uuid4().hex[:6]}", _WS_AUTHORIZER_CODE)
     auth_id = apigw.create_authorizer(
-        ApiId=api_id, AuthorizerType="JWT", Name="ws-jwt",
-        IdentitySource=["$request.querystring.token"],
-        JwtConfiguration={"Audience": ["ws-client"], "Issuer": issuer},
+        ApiId=api_id, AuthorizerType="REQUEST", Name="ws-request",
+        AuthorizerUri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{fn_arn}/invocations",
+        IdentitySource=list(identity_source),
     )["AuthorizerId"]
-    apigw.create_route(
-        ApiId=api_id, RouteKey="$connect",
-        Target=f"integrations/{integ['IntegrationId']}",
-        AuthorizationType="JWT", AuthorizerId=auth_id,
-    )
-    apigw.create_route(
-        ApiId=api_id, RouteKey="$default",
-        Target=f"integrations/{integ['IntegrationId']}",
-    )
-    apigw.create_stage(ApiId=api_id, StageName="prod")
+    connect = next(r for r in apigw.get_routes(ApiId=api_id)["Items"] if r["RouteKey"] == "$connect")
+    apigw.update_route(ApiId=api_id, RouteId=connect["RouteId"], AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+    return api_id
 
-    # Without a token → connection must be rejected (close code 1008).
-    with pytest.raises(Exception):
-        _WSClient("localhost", _EXECUTE_PORT, "/prod",
-                  headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
 
-    # With a valid token → connection must be accepted.
-    now = int(time.time())
-    token = _make_signed_token({
-        "sub": "ws-user", "iss": issuer, "aud": "ws-client",
-        "iat": now, "nbf": now - 1, "exp": now + 3600,
-    })
-    ws = _WSClient("localhost", _EXECUTE_PORT, f"/prod?token={token}",
-                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
-    ws.close()
-    cognito_idp.delete_user_pool(UserPoolId=pool_id)
+def _ws_handshake(api_id: str, path: str, headers: dict | None = None) -> tuple[int, dict]:
+    """Status and JSON body of a WebSocket upgrade request."""
+    import http.client
+
+    conn = http.client.HTTPConnection("localhost", _EXECUTE_PORT, timeout=30)
+    try:
+        conn.request("GET", path, headers={
+            "Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}", "Upgrade": "websocket",
+            "Connection": "Upgrade", "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(),
+            "Sec-WebSocket-Version": "13", **(headers or {}),
+        })
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read() or b"{}")
+    finally:
+        conn.close()
+
+
+def test_ws_connect_request_authorizer_refuses_the_handshake(apigw, lam):
+    """A $connect REQUEST authorizer refuses with 401 (identity source missing), 403 (denied) or 500."""
+    api_id = _wire_ws_request_authorizer_api(apigw, lam)
+    cases = [
+        ("/prod", {}, 401, "Unauthorized"),
+        ("/prod", {"Auth": "allow"}, 401, "Unauthorized"),
+        ("/prod?tok=1", {"Auth": "deny"}, 403,
+         "User is not authorized to access this resource with an explicit deny in an identity-based policy"),
+        ("/prod?tok=1", {"Auth": "other"}, 403,
+         "User is not authorized to access this resource because no identity-based policy allows "
+         "the execute-api:Invoke action"),
+        ("/prod?tok=1", {"Auth": "error"}, 500, ""),
+    ]
+    for path, headers, status, message in cases:
+        got_status, body = _ws_handshake(api_id, path, headers)
+        assert (got_status, body.get("message")) == (status, message), (path, headers)
+        assert body["connectionId"] and body["requestId"]
+
+
+def test_ws_connect_request_authorizer_reads_stage_variables(apigw, lam):
+    """A stageVariables.* identity source is present once the stage defines that variable."""
+    api_id = _wire_ws_request_authorizer_api(apigw, lam, identity_source=("route.request.header.Auth",
+                                                                          "stageVariables.tier"))
+    assert _ws_handshake(api_id, "/prod", {"Auth": "deny"})[0] == 401
+    apigw.update_stage(ApiId=api_id, StageName="prod", StageVariables={"tier": "gold"})
+    assert _ws_handshake(api_id, "/prod", {"Auth": "deny"})[0] == 403
+
+
+def test_ws_connect_request_authorizer_context_reaches_the_routes(apigw, lam):
+    """An allowed $connect passes principalId and the stringified context to $connect and later messages."""
+    api_id = _wire_ws_request_authorizer_api(apigw, lam)
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod?tok=1",
+                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}", "Auth": "allow"})
+    try:
+        ws.send(json.dumps({"action": "x"}))
+        reply = json.loads(ws.recv())
+    finally:
+        ws.close()
+    authorizer = reply["authorizer"]
+    assert authorizer.pop("requestId")
+    assert authorizer == {
+        "principalId": "alice", "user": "alice", "n": "7", "ok": "true", "type": "REQUEST", "eventType": "CONNECT",
+        "methodArn": f"arn:aws:execute-api:us-east-1:000000000000:{api_id}/prod/$connect",
+    }
+
+
+@pytest.mark.parametrize("resource, message", [
+    ({"Type": "AWS::ApiGatewayV2::Authorizer", "Properties": {
+        "AuthorizerType": "JWT", "Name": "jwt", "IdentitySource": ["route.request.querystring.token"],
+        "JwtConfiguration": {"Audience": ["client"], "Issuer": "https://issuer.example.com"}}},
+     "Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis."),
+    ({"Type": "AWS::ApiGatewayV2::Route", "Properties": {"RouteKey": "$connect", "AuthorizationType": "JWT"}},
+     "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"),
+    ({"Type": "AWS::ApiGatewayV2::Route", "Properties": {"RouteKey": "send", "AuthorizationType": "CUSTOM"}},
+     "Currently, authorization is restricted to the $connect route only"),
+], ids=["jwt-authorizer", "jwt-route", "custom-on-send"])
+def test_ws_cfn_refuses_route_authorization_a_websocket_api_does_not_support(cfn, resource, message):
+    """A template fails the stack where CreateAuthorizer or CreateRoute would answer BadRequestException."""
+    stack = f"ws-cfnauth-{uuid.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {
+        "Api": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {
+            "Name": stack, "ProtocolType": "WEBSOCKET", "RouteSelectionExpression": "$request.body.action"}},
+        "Refused": {"Type": resource["Type"], "Properties": {"ApiId": {"Ref": "Api"}, **resource["Properties"]}},
+    }}))
+    try:
+        for _ in range(60):
+            status = cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+            if not status.endswith("_IN_PROGRESS"):
+                break
+            time.sleep(1)
+        assert status == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "Refused"]
+        assert any(message in r for r in reasons), reasons
+    finally:
+        cfn.delete_stack(StackName=stack)
+
+
+def test_ws_route_authorization_limited_to_connect_and_request_authorizers(apigw):
+    """A WebSocket API takes REQUEST authorizers only, and route authorization on $connect only, never JWT."""
+    api_id = apigw.create_api(Name=f"ws-auth-rules-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")["ApiId"]
+
+    def refused(message, call, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(ApiId=api_id, **kwargs)
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert exc.value.response["Error"]["Message"] == message
+
+    refused("Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis.",
+            apigw.create_authorizer, AuthorizerType="JWT", Name="jwt",
+            IdentitySource=["route.request.header.Auth"],
+            JwtConfiguration={"Audience": ["client"], "Issuer": "https://issuer.example.com"})
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, AuthorizerType="REQUEST", Name="request", IdentitySource=["route.request.header.Auth"],
+        AuthorizerUri="arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                      "arn:aws:lambda:us-east-1:000000000000:function:auth/invocations",
+    )["AuthorizerId"]
+    jwt_refused = "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"
+    refused(jwt_refused, apigw.create_route, RouteKey="$connect", AuthorizationType="JWT", AuthorizerId=auth_id)
+    connect_id = apigw.create_route(ApiId=api_id, RouteKey="$connect")["RouteId"]
+    refused(jwt_refused, apigw.update_route, RouteId=connect_id, AuthorizationType="JWT", AuthorizerId=auth_id)
+    assert apigw.update_route(
+        ApiId=api_id, RouteId=connect_id, AuthorizationType="CUSTOM", AuthorizerId=auth_id,
+    )["AuthorizationType"] == "CUSTOM"
+
+    connect_only = "Currently, authorization is restricted to the $connect route only"
+    refused(connect_only, apigw.create_route, RouteKey="sendMessage", AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+    refused(connect_only, apigw.create_route, RouteKey="sendMessage", AuthorizationType="AWS_IAM")
+    message_id = apigw.create_route(ApiId=api_id, RouteKey="sendMessage")["RouteId"]
+    refused(connect_only, apigw.update_route, RouteId=message_id, AuthorizationType="CUSTOM", AuthorizerId=auth_id)
 
 
 def test_apigwv1_path_based_restapi_legacy_user_request(apigw_v1, lam):
@@ -4191,6 +4431,65 @@ def test_apigwv2_authorizer_without_identity_source_does_not_cache(apigw, lam, s
         _v2_auth_delete_queue(sqs, qname)
 
 
+def test_apigwv2_authorizer_missing_identity_source_401s_without_invoking(apigw, lam, sqs):
+    """A declared identity source missing from the request is a 401 without
+    invoking the Lambda, even with caching disabled (``AuthorizerResultTtlInSeconds=0``).
+
+    AWS applies this identity-source short circuit independent of caching;
+    it is not only a caching optimization. The body matches AWS's own
+    compact-JSON gateway response exactly (no space after the colon).
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url)  # no Authorization header sent
+        assert status == 401
+        assert body == b'{"message":"Unauthorized"}'
+        assert _v2_auth_count(sqs, qname) == 0, "the authorizer Lambda must not be invoked"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+@pytest.mark.parametrize("source,ttl,calls,invocations", [
+    ("$context.identity.sourceIp", 0, 1, 1),
+    # "To cache responses per route, add $context.routeKey to your authorizer's identity sources."
+    ("$context.routeKey", 300, 2, 1),
+])
+def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs, source, ttl,
+                                                                  calls, invocations):
+    """A $context.* identity source is resolved from the request, so it is never missing and,
+    cached, keys the authorizer cache."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=[source], AuthorizerResultTtlInSeconds=ttl),
+    )
+    try:
+        for _ in range(calls):
+            status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
+            assert status != 401
+        assert _v2_auth_count(sqs, qname) == invocations
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
 def test_apigwv2_authorizer_cache_is_bounded():
     """The result cache is keyed on caller-supplied identity values, so it is
     capped rather than left to grow for the life of the process. Expired entries
@@ -4456,7 +4755,7 @@ def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_t
         (f"arn:aws:execute-api:us-east-1::/apis/{api_id}", "BadRequestException"),
         (f"arn:aws:apigateway:us-west-2::/apis/{api_id}", "BadRequestException"),
         (f"arn:aws:apigateway:us-east-1:000000000000:/apis/{api_id}", "BadRequestException"),
-        ("arn:aws:apigateway:us-east-1::/domainnames/example.com", "BadRequestException"),
+        ("arn:aws:apigateway:us-east-1::/domainnames/example.com", "NotFoundException"),
         (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes", "BadRequestException"),
         (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes/{route['routeId']}", "BadRequestException"),
         (
@@ -4493,3 +4792,182 @@ def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_t
     assert status == 404
     assert body["__type"] == "NotFoundException"
     assert _apigw._api_tags.get(stage_arn) is None
+
+
+# ---------------------------------------------------------------------------
+# Custom domain names and API mappings
+# ---------------------------------------------------------------------------
+
+_CERT_ARN = "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"
+
+
+def _domain(apigw, name, **kwargs):
+    return apigw.create_domain_name(
+        DomainName=name,
+        DomainNameConfigurations=[{"CertificateArn": _CERT_ARN, "EndpointType": "REGIONAL",
+                                   "SecurityPolicy": "TLS_1_2"}],
+        **kwargs,
+    )
+
+
+def test_apigwv2_domain_name_crud_shared_with_v1(apigw, apigw_v1):
+    name = f"api-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    created = _domain(apigw, name, Tags={"team": "a"})
+    try:
+        assert created["DomainName"] == name
+        assert created["DomainNameArn"] == f"arn:aws:apigateway:us-east-1::/domainnames/{name}"
+        assert created["ApiMappingSelectionExpression"] == "$request.basepath"
+        assert created["RoutingMode"] == "API_MAPPING_ONLY"
+        assert created["Tags"] == {"team": "a"}
+        [config] = created["DomainNameConfigurations"]
+        assert config["CertificateArn"] == _CERT_ARN
+        assert config["EndpointType"] == "REGIONAL"
+        assert config["DomainNameStatus"] == "AVAILABLE"
+        assert config["ApiGatewayDomainName"].startswith("d-")
+
+        assert apigw.get_domain_name(DomainName=name)["DomainNameConfigurations"] == [config]
+        assert name in [d["DomainName"] for d in apigw.get_domain_names()["Items"]]
+        # One resource with API Gateway v1, as on AWS.
+        v1 = apigw_v1.get_domain_name(domainName=name)
+        assert v1["regionalCertificateArn"] == _CERT_ARN
+        assert v1["regionalDomainName"] == config["ApiGatewayDomainName"]
+
+        updated = apigw.update_domain_name(
+            DomainName=name,
+            DomainNameConfigurations=[{"CertificateArn": _CERT_ARN.replace("1111", "9999"),
+                                       "EndpointType": "REGIONAL"}],
+        )
+        assert updated["DomainNameConfigurations"][0]["CertificateArn"].endswith("99999999-2222-3333-4444-555555555555")
+
+        with pytest.raises(ClientError) as exc:
+            _domain(apigw, name)
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_domain_name(DomainName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_domain_name(domainName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_apigwv2_domain_name_tags(apigw):
+    name = f"tags-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    arn = _domain(apigw, name)["DomainNameArn"]
+    try:
+        apigw.tag_resource(ResourceArn=arn, Tags={"env": "dev"})
+        assert apigw.get_tags(ResourceArn=arn)["Tags"] == {"env": "dev"}
+        assert apigw.get_domain_name(DomainName=name)["Tags"] == {"env": "dev"}
+        apigw.untag_resource(ResourceArn=arn, TagKeys=["env"])
+        assert apigw.get_tags(ResourceArn=arn)["Tags"] == {}
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+
+
+def test_apigwv2_api_mapping_crud(apigw, apigw_v1):
+    name = f"map-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"map-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    _domain(apigw, name)
+    try:
+        mapping = apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
+        mapping_id = mapping["ApiMappingId"]
+        assert (mapping["ApiId"], mapping["Stage"], mapping["ApiMappingKey"]) == (api_id, "prod", "orders")
+        assert apigw.get_api_mapping(DomainName=name, ApiMappingId=mapping_id)["ApiMappingKey"] == "orders"
+        assert [m["ApiMappingId"] for m in apigw.get_api_mappings(DomainName=name)["Items"]] == [mapping_id]
+        # The v1 view of the same mapping, without the v2 id.
+        v1 = apigw_v1.get_base_path_mapping(domainName=name, basePath="orders")
+        assert {k: v for k, v in v1.items() if k != "ResponseMetadata"} == {
+            "basePath": "orders", "restApiId": api_id, "stage": "prod"}
+
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+        assert exc.value.response["Error"]["Message"] == "ApiMapping key already exists for this domain name"
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId="nope123", Stage="prod")
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+        updated = apigw.update_api_mapping(DomainName=name, ApiMappingId=mapping_id, ApiId=api_id,
+                                           ApiMappingKey="v2/orders")
+        assert updated["ApiMappingKey"] == "v2/orders"
+        assert updated["ApiMappingId"] == mapping_id
+
+        apigw.delete_api_mapping(DomainName=name, ApiMappingId=mapping_id)
+        assert apigw.get_api_mappings(DomainName=name)["Items"] == []
+        with pytest.raises(ClientError) as exc:
+            apigw.get_api_mapping(DomainName=name, ApiMappingId=mapping_id)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+def test_apigwv2_custom_domain_routes_to_http_api(apigw):
+    server, _thread, captured = _start_echo_server()
+    port = server.server_address[1]
+    name = f"route-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"route-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    integration_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="HTTP_PROXY", IntegrationMethod="GET",
+        IntegrationUri=f"http://127.0.0.1:{port}/backend", PayloadFormatVersion="1.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{integration_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+    _domain(apigw, name)
+    try:
+        apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="$default", ApiMappingKey="v1")
+        req = urllib.request.Request(f"http://localhost:{_EXECUTE_PORT}/v1/hello", method="GET")
+        req.add_header("Host", name)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+        # The mapping key is stripped; the API sees /hello.
+        assert captured["path"].endswith("/hello") and "/v1" not in captured["path"]
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+        server.shutdown()
+
+
+def test_apigwv2_api_mapping_requires_an_existing_stage(apigw):
+    name = f"stage-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"stage-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    _domain(apigw, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="missing")
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert exc.value.response["Error"]["Message"] == "Invalid stage identifier specified"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+def test_apigwv2_domain_names_and_api_mappings_paginate(apigw):
+    names = [f"page{i}-{_uuid_mod.uuid4().hex[:8]}.example.com" for i in range(3)]
+    api_id = apigw.create_api(Name=f"page-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    for name in names:
+        _domain(apigw, name)
+    try:
+        seen, token = [], None
+        while True:
+            page = apigw.get_domain_names(MaxResults="1", **({"NextToken": token} if token else {}))
+            assert len(page["Items"]) <= 1
+            seen += [d["DomainName"] for d in page["Items"]]
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(seen)
+
+        for key in ("a", "b"):
+            apigw.create_api_mapping(DomainName=names[0], ApiId=api_id, Stage="prod", ApiMappingKey=key)
+        first = apigw.get_api_mappings(DomainName=names[0], MaxResults="1")
+        second = apigw.get_api_mappings(DomainName=names[0], MaxResults="1", NextToken=first["NextToken"])
+        assert [m["ApiMappingKey"] for m in first["Items"] + second["Items"]] == ["a", "b"]
+        assert "NextToken" not in second
+    finally:
+        for name in names:
+            apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
