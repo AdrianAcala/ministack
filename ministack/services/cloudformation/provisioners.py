@@ -664,10 +664,6 @@ def _requires_replacement_pipes(old_props, new_props):
 # custom-named resource (you must rename it first), so MiniStack must fail the
 # update instead of silently executing the replacement and destroying data
 # (issue #1433).
-# A replacement is a change to a property of the type's _REPLACING_PROPERTIES
-# row, or one ``requires_replacement`` adds. A type with an ``exists`` message
-# is not refused up front: AWS runs the create, which fails with that message
-# because the predecessor still holds the name.
 # An ``exists`` entry is not refused up front: the replacement's create fails on the name.
 _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
@@ -921,14 +917,6 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with five exceptions. Four have a
-    deterministic generated name (the DynamoDB table, the IoT thing type and
-    the ElastiCache cache cluster and replication group): the replacement
-    takes the name back, so there is nothing left to retain. The fifth is the
-    Lambda permission's degenerate ``Id`` branch,
-    which removes and re-puts one statement under a Sid that cannot change:
-    the physical id is kept, nothing is replaced, and the policy does not
-    apply.
     cannot be forgotten at one site.
     """
     if _RETAIN_REPLACED.get():
@@ -1093,6 +1081,7 @@ _STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
     "AWS::ApiGateway::UsagePlan": ("Tags", "list"),
     "AWS::ApiGatewayV2::Api": ("Tags", "map"),
     "AWS::ApiGatewayV2::Stage": ("Tags", "map"),
+    "AWS::ApiGatewayV2::DomainName": ("Tags", "map"),
     "AWS::AppConfig::Application": ("Tags", "list"),
     "AWS::AppConfig::ConfigurationProfile": ("Tags", "list"),
     "AWS::AppConfig::Deployment": ("Tags", "list"),
@@ -2213,10 +2202,6 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     published versions, aliases, the resource policy, tags, event invoke
     configs. Going through the Lambda module's own update paths keeps them.
 
-    FunctionName, PackageType and TenancyConfig changes are replaced in
-    ``_update_resource`` before this runs. A DurableConfig change may require
-    replacement on AWS; under the same physical name the closest local
-    equivalent is the full re-provision the create fallback always did.
     FunctionName, PackageType and TenancyConfig are replaced in ``_update_resource``;
     a DurableConfig change re-provisions under the same name.
     """
@@ -2718,10 +2703,6 @@ def _iam_ip_roles(props):
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    # A generated name belongs to this stack resource, so a profile left under
-    # it is taken over; a custom name goes through CreateInstanceProfile as it
-    # is, and its EntityAlreadyExists keeps one stack from writing over a
-    # profile another stack or the API owns.
     # A generated name is this stack's to take over; a custom one meets EntityAlreadyExists.
     if not props.get("InstanceProfileName"):
         _iam._instance_profiles.pop(name, None)
@@ -2775,7 +2756,10 @@ def _iam_ip_delete(physical_id, props):
 _SSM_CFN_PARAMETER_TYPES = ("String", "StringList")
 
 
-def _ssm_check_type(props):
+def _ssm_check_type(props, logical_id):
+    if isinstance(props.get("Value"), list):
+        raise ValueError(f"Properties validation failed for resource {logical_id} with message: "
+                         "[#/Value: expected type: String, found: JSONArray]")
     ptype = props.get("Type", "String")
     if ptype not in _SSM_CFN_PARAMETER_TYPES:
         raise ValueError(
@@ -2815,7 +2799,7 @@ def _ssm_create(logical_id, props, stack_name):
     # two doors into the same store behave alike: a create over an existing
     # parameter fails as real CloudFormation does (`ParameterAlreadyExists`), and
     # Version/history stay consistent with the API path.
-    _ssm_check_type(props)
+    _ssm_check_type(props, logical_id)
     name = props.get("Name") or f"/{stack_name}/{logical_id}"
     data = _ssm_put_data(name, props)
     status, _headers, body = _ssm._put_parameter(data)
@@ -2824,8 +2808,8 @@ def _ssm_create(logical_id, props, stack_name):
     return name, _ssm_attrs(name, data)
 
 
-def _ssm_update(physical_id, old_props, new_props, stack_name):
-    _ssm_check_type(new_props)
+def _ssm_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    _ssm_check_type(new_props, logical_id or physical_id)
     new_name = new_props.get("Name")
     if new_name and new_name != physical_id:
         # Name is Update requires: Replacement — create the new parameter and
@@ -9316,30 +9300,17 @@ def _sd_instance_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
-# EFS (AWS::EFS::*)
-#
-# Every handler goes through efs.py's own functions, so a stack-created file
-# system, mount target or access point is the record the EFS API writes. Ref,
-# Fn::GetAtt and the replacement properties follow the CloudFormation Template
-# Reference pages for the three types. A replacement property is listed in
-# _REPLACING_PROPERTIES and replaced by the engine before these update handlers
-# run, so the handlers only change what updates in place.
+# EFS (AWS::EFS::*) — through efs.py; create-only properties are replaced by the engine.
 # ---------------------------------------------------------------------------
 
 def _efs_result(response, what, missing_ok=False):
-    """The parsed body of an efs call, or ValueError naming ``what``. With
-    ``missing_ok`` a 404 (resource already gone) returns None."""
+    """The parsed body of an efs call; a 404 returns None when ``missing_ok``."""
     status, _, body = response
     if status == 404 and missing_ok:
         return None
     if status >= 400:
         raise ValueError(f"{what} failed: {body!r}")
     return json.loads(body) if body else {}
-
-
-def _efs_file_system_id(value):
-    """A file system id from an id or a ``...:file-system/fs-...`` ARN."""
-    return str(value or "").rsplit("/", 1)[-1]
 
 
 def _efs_policy_json(policy):
@@ -9379,8 +9350,7 @@ def _efs_put_protection(fs_id, protection):
 
 
 def _efs_replication_destinations(configuration):
-    """The Destinations a ReplicationConfiguration property sends to the API:
-    Status and StatusMessage describe the destination, they do not configure it."""
+    """The API Destinations, without the read-only Status and StatusMessage."""
     return [
         {k: v for k, v in destination.items() if k not in ("Status", "StatusMessage")}
         for destination in (configuration or {}).get("Destinations") or []
@@ -9400,8 +9370,7 @@ def _efs_delete_replication(fs_id):
 
 
 def _efs_file_system_create(logical_id, props, stack_name):
-    # No CreationToken: efs.py returns the existing file system for a repeated
-    # token, which would turn a replacement into a no-op.
+    # No CreationToken: a repeated one would return the predecessor on a replacement.
     body = {
         key: props[key]
         for key in ("PerformanceMode", "ThroughputMode", "KmsKeyId",
@@ -9428,8 +9397,7 @@ def _efs_file_system_create(logical_id, props, stack_name):
 
 
 def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """AvailabilityZoneName, Encrypted, KmsKeyId and PerformanceMode replace
-    the file system in the engine. Everything else changes in place."""
+    """The in-place properties; the create-only ones are replaced by the engine."""
     fs = _efs._file_systems.get(physical_id)
     if fs is None:
         return _efs_file_system_create(logical_id or physical_id, new_props, stack_name)
@@ -9466,16 +9434,14 @@ def _efs_file_system_update(physical_id, old_props, new_props, stack_name, logic
 
 
 def _efs_file_system_delete(physical_id, props):
-    # A file system in a replication configuration cannot be deleted; the
-    # destination it created stays, as on AWS.
+    # A replicating file system cannot be deleted; the destination stays, as on AWS.
     _efs_delete_replication(physical_id)
     _efs_result(_efs._delete_file_system(physical_id),
                 "AWS::EFS::FileSystem delete", missing_ok=True)
 
 
 def _efs_mount_target_attrs(mount_target):
-    # Id is the file system id, as the CloudFormation reference documents.
-    # An IPV6_ONLY mount target has no IPv4 address.
+    # Id is the file system id (template reference); IPV6_ONLY has no IpAddress.
     attrs = {"Id": mount_target["FileSystemId"]}
     if "IpAddress" in mount_target:
         attrs["IpAddress"] = mount_target["IpAddress"]
@@ -9484,7 +9450,7 @@ def _efs_mount_target_attrs(mount_target):
 
 def _efs_mount_target_create(logical_id, props, stack_name):
     body = {
-        "FileSystemId": _efs_file_system_id(props.get("FileSystemId")),
+        "FileSystemId": _efs._fs_id_from(props.get("FileSystemId")),
         "SubnetId": props.get("SubnetId", ""),
         "SecurityGroups": list(props.get("SecurityGroups") or []),
     }
@@ -9496,8 +9462,7 @@ def _efs_mount_target_create(logical_id, props, stack_name):
 
 
 def _efs_mount_target_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """FileSystemId, SubnetId, IpAddress, IpAddressType and Ipv6Address replace
-    the mount target in the engine; SecurityGroups change in place."""
+    """SecurityGroups change in place; the rest is replaced by the engine."""
     mount_target = _efs._mount_targets.get(physical_id)
     if mount_target is None:
         return _efs_mount_target_create(logical_id or physical_id, new_props, stack_name)
@@ -9539,7 +9504,7 @@ def _efs_access_point_attrs(access_point):
 
 
 def _efs_access_point_create(logical_id, props, stack_name):
-    body = {"FileSystemId": _efs_file_system_id(props.get("FileSystemId"))}
+    body = {"FileSystemId": _efs._fs_id_from(props.get("FileSystemId"))}
     if props.get("PosixUser"):
         body["PosixUser"] = _efs_posix_user(props["PosixUser"])
     if props.get("RootDirectory"):
@@ -9553,8 +9518,7 @@ def _efs_access_point_create(logical_id, props, stack_name):
 
 
 def _efs_access_point_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    """FileSystemId, ClientToken, PosixUser and RootDirectory replace the access
-    point in the engine; AccessPointTags change in place."""
+    """AccessPointTags change in place; the rest is replaced by the engine."""
     access_point = _efs._access_points.get(physical_id)
     if access_point is None:
         return _efs_access_point_create(logical_id or physical_id, new_props, stack_name)
@@ -10075,6 +10039,84 @@ def _apigw_v2_stage_delete(physical_id, props):
         api_id, stage_name = parts
         stages = _apigw_v2._stages.get(api_id, {})
         stages.pop(stage_name, None)
+
+
+# ---------------------------------------------------------------------------
+# ApiGatewayV2 DomainName and ApiMapping
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_result(resp, what, missing_ok=False):
+    if resp[0] == 404 and missing_ok:
+        return None
+    if resp[0] >= 400:
+        raise ValueError(f"{what} failed: {resp[2]!r}")
+    return json.loads(resp[2]) if resp[2] else {}
+
+
+def _apigw_v2_domain_body(props):
+    return {
+        "domainNameConfigurations": _pascal_to_camel(props.get("DomainNameConfigurations") or []),
+        "mutualTlsAuthentication": _pascal_to_camel(props.get("MutualTlsAuthentication") or {}),
+        "routingMode": props.get("RoutingMode", "API_MAPPING_ONLY"),
+    }
+
+
+def _apigw_v2_domain_attrs(view):
+    config = view["domainNameConfigurations"][0]
+    return {"DomainNameArn": view["domainNameArn"],
+            "RegionalDomainName": config["apiGatewayDomainName"],
+            "RegionalHostedZoneId": config["hostedZoneId"]}
+
+
+def _apigw_v2_domain_create(logical_id, props, stack_name):
+    body = {"domainName": props.get("DomainName", ""), "tags": dict(props.get("Tags") or {}),
+            **_apigw_v2_domain_body(props)}
+    view = _apigw_v2_result(_apigw_v2._create_domain_name(body), "AWS::ApiGatewayV2::DomainName create")
+    return view["domainName"], _apigw_v2_domain_attrs(view)
+
+
+def _apigw_v2_domain_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is replaced by the engine; the rest updates in place."""
+    import ministack.services.apigateway_v1 as _apigw_v1
+    view = _apigw_v2_result(_apigw_v2._update_domain_name(physical_id, _apigw_v2_domain_body(new_props)),
+                            "AWS::ApiGatewayV2::DomainName update", missing_ok=True)
+    if view is None:
+        return _apigw_v2_domain_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_map(_apigw_v1._v1_tags.setdefault(view["domainNameArn"], {}), old_props, new_props)
+    return physical_id, _apigw_v2_domain_attrs(view)
+
+
+def _apigw_v2_domain_delete(physical_id, props):
+    _apigw_v2_result(_apigw_v2._delete_domain_name(physical_id),
+                     "AWS::ApiGatewayV2::DomainName delete", missing_ok=True)
+
+
+def _apigw_v2_mapping_body(props):
+    return {"apiId": props.get("ApiId", ""), "stage": props.get("Stage", ""),
+            "apiMappingKey": props.get("ApiMappingKey", "")}
+
+
+def _apigw_v2_mapping_create(logical_id, props, stack_name):
+    mapping = _apigw_v2_result(
+        _apigw_v2._create_api_mapping(props.get("DomainName", ""), _apigw_v2_mapping_body(props)),
+        "AWS::ApiGatewayV2::ApiMapping create")
+    return mapping["apiMappingId"], {"ApiMappingId": mapping["apiMappingId"]}
+
+
+def _apigw_v2_mapping_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """DomainName is replaced by the engine; ApiId, ApiMappingKey and Stage update in place."""
+    mapping = _apigw_v2_result(
+        _apigw_v2._update_api_mapping(new_props.get("DomainName", ""), physical_id,
+                                      _apigw_v2_mapping_body(new_props)),
+        "AWS::ApiGatewayV2::ApiMapping update", missing_ok=True)
+    if mapping is None:
+        return _apigw_v2_mapping_create(logical_id or physical_id, new_props, stack_name)
+    return physical_id, {"ApiMappingId": physical_id}
+
+
+def _apigw_v2_mapping_delete(physical_id, props):
+    _apigw_v2_result(_apigw_v2._delete_api_mapping(props.get("DomainName", ""), physical_id),
+                     "AWS::ApiGatewayV2::ApiMapping delete", missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -13075,14 +13117,6 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
-# CloudFormation replacement rules, checked against DescribeType and change
-# sets. A row lists the schema's createOnlyProperties (Always); the conditional
-# table below lists its conditionalCreateOnlyProperties (Conditionally). Any
-# other property of a listed type is in place (Never), as AWS reports it. A
-# stack update replaces the resource when an Always property changes. Service
-# API immutability is different: an update may fail without being reported as
-# a replacement (for example Cognito sign-in attributes). Types without a row
-# keep the conservative Conditionally answer and their handler's behavior.
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
@@ -13147,6 +13181,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
     "AWS::Glue::Trigger": ("Name", "WorkflowName", "Type"),
+    "AWS::ApiGatewayV2::DomainName": ("DomainName",),
+    "AWS::ApiGatewayV2::ApiMapping": ("DomainName",),
     "AWS::EFS::FileSystem": ("AvailabilityZoneName", "Encrypted", "KmsKeyId", "PerformanceMode"),
     "AWS::EFS::MountTarget": (
         "FileSystemId", "IpAddress", "IpAddressType", "Ipv6Address", "SubnetId",
@@ -13358,7 +13394,8 @@ _RESOURCE_HANDLERS = {
         "delete": _iam_ip_delete,
     },
     "AWS::SSM::Parameter": {
-        "create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete, "import": _ssm_import,
+        "create": _ssm_create, "update": _ssm_update, "update_with_logical_id": True,
+        "delete": _ssm_delete, "import": _ssm_import,
     },
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
@@ -13846,6 +13883,18 @@ _RESOURCE_HANDLERS = {
         "delete": _apigw_v2_route_delete,
     },
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
+    "AWS::ApiGatewayV2::DomainName": {
+        "create": _apigw_v2_domain_create,
+        "update": _apigw_v2_domain_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_domain_delete,
+    },
+    "AWS::ApiGatewayV2::ApiMapping": {
+        "create": _apigw_v2_mapping_create,
+        "update": _apigw_v2_mapping_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_mapping_delete,
+    },
     "AWS::SES::EmailIdentity": {
         "create": _ses_email_identity_create,
         "update": _ses_email_identity_update,

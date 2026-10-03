@@ -13,6 +13,7 @@ Python worker. No Docker or running Ministack instance is required.
 
 import io
 import json
+import os
 import shutil
 import zipfile
 from unittest.mock import MagicMock, mock_open, patch
@@ -419,4 +420,22 @@ def test_node_worker_cwd_is_code_dir():
         worker.kill()
 
     assert result["status"] == "ok", result
+    # macOS resolves /var to /private/var in process.cwd().
+    assert os.path.realpath(result["result"]["cwd"]) == os.path.realpath(result["result"]["root"])
+
+
+def test_python_worker_cwd_is_code_dir():
+    """os.getcwd() must be the extracted code root, as on AWS (LAMBDA_TASK_ROOT)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("index.py", "import os\n\ndef handler(event, context):\n"
+                                     "    return {'cwd': os.getcwd(), 'root': os.environ['LAMBDA_TASK_ROOT']}\n")
+    worker = Worker("test-fn", _config(), buf.getvalue())
+    try:
+        result = worker.invoke({}, request_id="cwd-request-id")
+    finally:
+        worker.kill()
+
+    assert result["status"] == "ok", result
+    assert os.path.realpath(result["result"]["cwd"]) == os.path.realpath(result["result"]["root"])
     assert result["result"]["cwd"] == result["result"]["root"]

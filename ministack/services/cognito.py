@@ -5518,8 +5518,7 @@ def _oauth2_authorize_federation(query_params):
         "redirect_uri": redirect_uri,
         "state": state,
         "scope": scope,
-        # The app's nonce belongs in the ID token MiniStack issues to the app;
-        # it is not forwarded to the external IdP.
+        # Echoed in the ID token issued to the app, not forwarded to the IdP.
         "nonce": nonce,
         "provider_name": identity_provider,
         "created_at": time.time(),
@@ -5705,8 +5704,7 @@ def _saml2_idp_response(body: bytes, query_params):
             logger.info("Cognito: PreSignUp Lambda rejected SAML federation sign-up for %s: %s",
                         username, e)
             return error_response_json("UserLambdaValidationException", str(e), 400)
-        # The trigger may have linked this identity (AdminLinkProviderForUser);
-        # AWS completes the same sign-in as the linked profile.
+        # A PreSignUp link (AdminLinkProviderForUser) signs in as the linked profile.
         linked_username = _linked_username_for_federation(
             pool, provider_name, name_id, user_attrs)
         if linked_username:
@@ -5942,8 +5940,7 @@ def _oauth2_idp_response(method, body, query_params):
             logger.info("Cognito: PreSignUp Lambda rejected OIDC federation sign-up for %s: %s",
                         username, e)
             return error_response_json("UserLambdaValidationException", str(e), 400)
-        # The trigger may have linked this identity (AdminLinkProviderForUser);
-        # AWS completes the same sign-in as the linked profile.
+        # A PreSignUp link (AdminLinkProviderForUser) signs in as the linked profile.
         linked_username = _linked_username_for_federation(
             pool, provider_name, name_id, user_attrs)
         if linked_username:

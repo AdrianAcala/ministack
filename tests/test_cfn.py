@@ -2245,6 +2245,36 @@ def test_cfn_condition_selects_from_comma_delimited_list(cfn):
         _delete_cfn_test_stack(cfn, name)
 
 
+def test_cfn_condition_select_out_of_range_is_a_template_error(cfn):
+    template = {
+        "Parameters": {"Spec": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Conditions": {"C": {"Fn::Equals": [{"Fn::Select": [5, {"Ref": "Spec"}]}, ""]}},
+        "Resources": {"T": {"Type": "AWS::SNS::Topic", "Condition": "C"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=f"cfn-sel-oob-{_uuid_mod.uuid4().hex[:8]}",
+                         TemplateBody=json.dumps(template))
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert exc.value.response["Error"]["Message"] == (
+        "Template error: Fn::Select cannot select nonexistent value at index 5")
+
+
+def test_cfn_ssm_parameter_rejects_a_list_value(cfn):
+    name = f"cfn-ssm-list-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Parameters": {"Names": {"Type": "CommaDelimitedList", "Default": "a,b"}},
+        "Resources": {"P": {"Type": "AWS::SSM::Parameter",
+                            "Properties": {"Type": "String", "Value": {"Ref": "Names"}}}},
+    }
+    try:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+        assert _wait_stack(cfn, name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert ("Properties validation failed for resource P with message: "
+                "[#/Value: expected type: String, found: JSONArray]") in _stack_event_reasons(cfn, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
 def test_cfn_outputs_exports(cfn):
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
@@ -6767,8 +6797,7 @@ def test_cfn_servicediscovery_cdk_ecs_shape(cfn, sd):
 
 
 # ---------------------------------------------------------------------------
-# AWS::EFS::* (#1873). Ref, Fn::GetAtt and replacement properties follow the
-# CloudFormation Template Reference pages for the three types.
+# AWS::EFS::*
 # ---------------------------------------------------------------------------
 
 _efs_physical_ids = _sd_physical_ids
@@ -6973,8 +7002,7 @@ def test_cfn_efs_update_replacement(cfn, efs):
     assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_COMPLETE"
     after = _efs_physical_ids(cfn, stack_name)
 
-    # PerformanceMode replaces the file system; the mount targets and the access
-    # point follow because their FileSystemId changed.
+    # The mount targets and access point follow the replaced file system.
     for logical_id in ("Fs", "Mt1", "Mt2", "Ap"):
         assert after[logical_id] != before[logical_id]
     assert efs.describe_file_systems(FileSystemId=after["Fs"])["FileSystems"][0]["PerformanceMode"] == "maxIO"
@@ -33304,3 +33332,56 @@ def test_cfn_elasticache_lambda_reaches_replication_group(cfn, lam):
         assert result.get("reply") == "+PONG", result
     finally:
         _delete_cfn_test_stack(cfn, stack)
+
+
+def _cfn_apigwv2_domain_template(domain, key):
+    return json.dumps({
+        "Resources": {
+            "Api": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {"Name": "dom-api", "ProtocolType": "HTTP"}},
+            "Stage": {"Type": "AWS::ApiGatewayV2::Stage",
+                      "Properties": {"ApiId": {"Ref": "Api"}, "StageName": "prod"}},
+            "Domain": {"Type": "AWS::ApiGatewayV2::DomainName", "Properties": {
+                "DomainName": domain, "Tags": {"team": "a"},
+                "DomainNameConfigurations": [{"EndpointType": "REGIONAL", "CertificateArn":
+                    "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"}]}},
+            "Mapping": {"Type": "AWS::ApiGatewayV2::ApiMapping", "DependsOn": ["Stage"], "Properties": {
+                "DomainName": {"Ref": "Domain"}, "ApiId": {"Ref": "Api"}, "Stage": "prod", "ApiMappingKey": key}},
+        },
+        "Outputs": {
+            "Domain": {"Value": {"Ref": "Domain"}},
+            "Regional": {"Value": {"Fn::GetAtt": ["Domain", "RegionalDomainName"]}},
+            "Arn": {"Value": {"Fn::GetAtt": ["Domain", "DomainNameArn"]}},
+            "Mapping": {"Value": {"Ref": "Mapping"}},
+            "MappingId": {"Value": {"Fn::GetAtt": ["Mapping", "ApiMappingId"]}},
+        },
+    })
+
+
+def test_cfn_apigwv2_domain_name_and_api_mapping(cfn, apigw):
+    stack_name = f"cfn-apigw-dom-{_uuid_mod.uuid4().hex[:8]}"
+    domain = f"{stack_name}.example.com"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v1"))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Domain") == domain
+        assert _output(stack, "Arn") == f"arn:aws:apigateway:us-east-1::/domainnames/{domain}"
+        got = apigw.get_domain_name(DomainName=domain)
+        assert _output(stack, "Regional") == got["DomainNameConfigurations"][0]["ApiGatewayDomainName"]
+        assert got["Tags"]["team"] == "a"
+        assert got["Tags"]["aws:cloudformation:logical-id"] == "Domain"
+        mapping_id = _output(stack, "Mapping")
+        assert _output(stack, "MappingId") == mapping_id
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v1"
+
+        # ApiMappingKey updates in place.
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_apigwv2_domain_template(domain, "v2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", _stack_event_reasons(cfn, stack_name)
+        assert _output(stack, "Mapping") == mapping_id
+        assert apigw.get_api_mapping(DomainName=domain, ApiMappingId=mapping_id)["ApiMappingKey"] == "v2"
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+    with pytest.raises(ClientError):
+        apigw.get_domain_name(DomainName=domain)
+
