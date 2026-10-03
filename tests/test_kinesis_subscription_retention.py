@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Local dispatch regressions for retention during an active subscription."""
 
 import asyncio
@@ -24,8 +26,6 @@ def subscription_state(monkeypatch):
     monkeypatch.setattr(kinesis, "_consumers", AccountRegionScopedDict())
     monkeypatch.setattr(kinesis, "_subscriptions", {})
     monkeypatch.setattr(kinesis, "_SUBSCRIPTION_IDLE_SECONDS", 0)
-    # Advance through multiple real 24-hour retention periods without renewing.
-    monkeypatch.setattr(kinesis, "SUBSCRIPTION_SECONDS", 7 * 24 * 3600)
     return clock
 
 
@@ -102,7 +102,9 @@ def test_subscription_delivers_after_repeated_retention_and_idle_polls(subscript
             consumer = await _setup()
             old = await _put(b"old")
             timestamp = clock[0]
-            clock[0] += 24 * 3600 - 1
+            clock[0] += 3
+            retained = await _put(b"retained")
+            clock[0] += 24 * 3600 - 4
             response = await _call("SubscribeToShard", {
                 "ConsumerARN": consumer, "ShardId": SHARD,
                 "StartingPosition": _starting(kind, old, timestamp),
@@ -110,17 +112,22 @@ def test_subscription_delivers_after_repeated_retention_and_idle_polls(subscript
             expected = []
 
             async def on_event(event, number):
-                # First deliver the selected backlog (or an empty LATEST/AFTER
-                # event), then prune it, idle, append, and repeat twice.
-                if number in (1, 4):
-                    clock[0] += 24 * 3600 + 2
+                # The two backlog records expire separately within the normal
+                # five-minute subscription lifetime. Idle and append after
+                # each pruning, while keeping newly delivered records alive.
+                if number == 1:
+                    clock[0] += 2
+                    kinesis._expire_records(kinesis._streams["retention"])
+                elif number == 4:
+                    clock[0] += 3
                     kinesis._expire_records(kinesis._streams["retention"])
                 elif number in (2, 5):
                     expected.append(await _put(f"new-{number}".encode()))
                 return number == 7
 
             events = await _run(response, is_cbor, on_event)
-            initial = [] if kind in ("LATEST", "AFTER_SEQUENCE_NUMBER") else [old]
+            initial = ([] if kind == "LATEST" else [retained] if kind == "AFTER_SEQUENCE_NUMBER"
+                       else [old, retained])
             assert [r["SequenceNumber"] for r in events[0]["Records"]] == initial
             assert [r["SequenceNumber"] for e in events[1:] for r in e["Records"]] == expected
             assert events[1]["Records"] == events[4]["Records"] == events[6]["Records"] == []
