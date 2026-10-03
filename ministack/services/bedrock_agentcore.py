@@ -23,6 +23,7 @@ against botocore ``bedrock-agentcore-control`` / ``bedrock-agentcore``
 service-2.json.
 """
 import asyncio
+import base64
 import copy
 import datetime
 import json
@@ -58,7 +59,8 @@ logger = logging.getLogger("bedrock_agentcore")
 _runtimes = AccountRegionScopedDict()    # agentRuntimeId -> runtime record
 _endpoints = AccountRegionScopedDict()   # agentRuntimeId -> {endpointName -> endpoint record}
 _resource_policies = AccountRegionScopedDict()  # resource ARN -> policy string
-_containers = {}  # (account, region, runtime id) -> Docker container
+_memories = AccountRegionScopedDict()    # memoryId -> memory record
+_containers = {}  # (account, region, runtime id, version) -> Docker container
 _container_lock = threading.RLock()
 
 # AgentRuntimeName / EndpointName: start with a letter, then letters/digits/_,
@@ -71,6 +73,7 @@ def get_state():
         "runtimes": _runtimes,
         "endpoints": _endpoints,
         "resourcePolicies": _resource_policies,
+        "memories": _memories,
     })
 
 
@@ -84,10 +87,18 @@ def _restore_state(data):
     _runtimes.clear()
     _endpoints.clear()
     _resource_policies.clear()
+    _memories.clear()
     _runtimes.update(data.get("runtimes", {}))
     _endpoints.update(data.get("endpoints", {}))
     _resource_policies.update(data.get("resourcePolicies", {}))
+    _memories.update(data.get("memories", {}))
     _migrate_legacy_arns()
+    # Backfill one snapshot for state written before version history existed.
+    for runtime in _runtimes._data.values():
+        if not runtime.get("_versions"):
+            runtime["_versions"] = {
+                runtime.get("agentRuntimeVersion", "1"): _version_snapshot(runtime)
+            }
 
 
 def _migrate_legacy_arns():
@@ -120,6 +131,7 @@ def reset():
     _runtimes.clear()
     _endpoints.clear()
     _resource_policies.clear()
+    _memories.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +286,10 @@ def _validation(message: str):
     return error_response_json("ValidationException", message, 400)
 
 
+def _runtime_not_found(runtime_id):
+    return _not_found(f"Agent '{runtime_id}' was not found. Please check the agent ID and try again.")
+
+
 def _not_found(message: str):
     return error_response_json("ResourceNotFoundException", message, 404)
 
@@ -289,6 +305,263 @@ def _parse_body(body) -> dict:
         return json.loads(body)
     except (ValueError, TypeError):
         return {}
+
+
+def _agentcore_query_value(query_params, key, default=None):
+    value = (query_params or {}).get(key, default)
+    if isinstance(value, list):
+        return value[0] if value else default
+    return value
+
+
+def _paginate_agentcore_results(items, query_params):
+    raw_limit = _agentcore_query_value(query_params, "maxResults", "10")
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return None, _validation("maxResults must be an integer from 1 to 100")
+    if not 1 <= limit <= 100:
+        return None, _validation("maxResults must be an integer from 1 to 100")
+
+    token = _agentcore_query_value(query_params, "nextToken")
+    offset = 0
+    if token is not None:
+        if not isinstance(token, str) or not token or len(token) > 2048:
+            return None, _validation("nextToken is invalid")
+        try:
+            padded = token + "=" * (-len(token) % 4)
+            token_bytes = base64.b64decode(
+                padded.encode(), altchars=b"-_", validate=True
+            )
+            offset = int(token_bytes.decode())
+            if offset < 0:
+                raise ValueError
+        except (ValueError, TypeError, base64.binascii.Error):
+            return None, _validation("nextToken is invalid")
+
+    page = {"items": items[offset:offset + limit]}
+    if offset + limit < len(items):
+        page["nextToken"] = base64.urlsafe_b64encode(
+            str(offset + limit).encode()
+        ).decode().rstrip("=")
+    return page, None
+
+
+def _memory_arn(memory_id):
+    return (f"arn:aws:bedrock-agentcore:{get_region()}:{get_account_id()}:"
+            f"memory/{memory_id}")
+
+
+def _memory_public_record(record):
+    return {key: copy.deepcopy(value) for key, value in record.items()
+            if not key.startswith("_")}
+
+
+_MEMORY_ID_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}")
+
+# MemoryStrategyInput union member -> MemoryStrategyType.
+_MEMORY_STRATEGY_TYPES = {
+    "semanticMemoryStrategy": "SEMANTIC",
+    "summaryMemoryStrategy": "SUMMARIZATION",
+    "userPreferenceMemoryStrategy": "USER_PREFERENCE",
+    "customMemoryStrategy": "CUSTOM",
+    "episodicMemoryStrategy": "EPISODIC",
+}
+
+
+def _memory_strategies(inputs, now):
+    """MemoryStrategy records for a MemoryStrategyInputList, or an error response."""
+    if not isinstance(inputs, list):
+        return None, _validation("memoryStrategies must be a list")
+    strategies = []
+    for item in inputs:
+        members = [key for key in item if key in _MEMORY_STRATEGY_TYPES] if isinstance(item, dict) else []
+        if len(members) != 1 or len(item) != 1:
+            return None, _validation("Each memory strategy must set exactly one strategy type")
+        spec = item[members[0]]
+        name = spec.get("name") if isinstance(spec, dict) else None
+        if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+            return None, _validation("Memory strategy name is invalid")
+        strategy = {
+            "strategyId": _resource_id(name),
+            "name": name,
+            "type": _MEMORY_STRATEGY_TYPES[members[0]],
+            "namespaces": copy.deepcopy(spec.get("namespaces", [])),
+            "namespaceTemplates": copy.deepcopy(spec.get("namespaceTemplates", [])),
+            "status": "ACTIVE",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        for field in ("description", "memoryRecordSchema"):
+            if field in spec:
+                strategy[field] = copy.deepcopy(spec[field])
+        strategies.append(strategy)
+    return strategies, None
+
+
+def _modify_memory_strategies(record, changes, now):
+    """Apply ModifyMemoryStrategies to a copy of the record's strategies."""
+    if not isinstance(changes, dict):
+        return None, _validation("memoryStrategies must be an object")
+    strategies = copy.deepcopy(record.get("strategies", []))
+    by_id = {strategy["strategyId"]: strategy for strategy in strategies}
+    for item in changes.get("deleteMemoryStrategies") or []:
+        strategy_id = (item or {}).get("memoryStrategyId")
+        if strategy_id not in by_id:
+            return None, _not_found(f"Memory strategy '{strategy_id}' not found")
+        strategies.remove(by_id.pop(strategy_id))
+    for item in changes.get("modifyMemoryStrategies") or []:
+        strategy_id = (item or {}).get("memoryStrategyId")
+        if strategy_id not in by_id:
+            return None, _not_found(f"Memory strategy '{strategy_id}' not found")
+        for field in ("description", "namespaces", "namespaceTemplates", "memoryRecordSchema"):
+            if field in item:
+                by_id[strategy_id][field] = copy.deepcopy(item[field])
+        by_id[strategy_id]["updatedAt"] = now
+    added, error = _memory_strategies(changes.get("addMemoryStrategies") or [], now)
+    if error:
+        return None, error
+    return strategies + added, None
+
+
+def _memory_page(items, data, default=20):
+    query = {"maxResults": data.get("maxResults", default)}
+    if "nextToken" in data:
+        query["nextToken"] = data["nextToken"]
+    return _paginate_agentcore_results(items, query)
+
+
+def _create_memory(body):
+    data = _parse_body(body)
+    name = data.get("name")
+    duration = data.get("eventExpiryDuration")
+    if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
+        return _validation("name must start with a letter and contain only letters, digits, and underscores")
+    if any(memory.get("name") == name for memory in _memories.values()):
+        return _conflict(f"A memory with name '{name}' already exists")
+    if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
+        return _validation("eventExpiryDuration must be an integer from 3 to 365")
+    tags = data.get("tags") or {}
+    if not isinstance(tags, dict) or len(tags) > 50:
+        return _validation("tags must be a map of at most 50 entries")
+    now = int(time.time())
+    # Strategies are recorded; no extraction runs behind them.
+    strategies, error = _memory_strategies(data.get("memoryStrategies") or [], now)
+    if error:
+        return error
+
+    memory_id = _resource_id(name)
+    record = {
+        "id": memory_id,
+        "arn": _memory_arn(memory_id),
+        "name": name,
+        "eventExpiryDuration": duration,
+        "status": "ACTIVE",
+        "createdAt": now,
+        "updatedAt": now,
+        "strategies": strategies,
+        "_tags": copy.deepcopy(tags),
+    }
+    for field in ("description", "encryptionKeyArn", "memoryExecutionRoleArn",
+                  "indexedKeys", "namespaceKeys", "streamDeliveryResources"):
+        if field in data:
+            record[field] = copy.deepcopy(data[field])
+    _memories[memory_id] = record
+
+    response = _memory_public_record(record)
+    response["status"] = "CREATING"
+    return json_response({"memory": response}, 202)
+
+
+def _get_memory(memory_id, query_params):
+    record = _memories.get(memory_id)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    view = _agentcore_query_value(query_params, "view", "full")
+    if view not in ("full", "without_decryption"):
+        return _validation("view must be 'full' or 'without_decryption'")
+    return json_response({"memory": _memory_public_record(record)})
+
+
+def _list_memories(body):
+    data = _parse_body(body)
+    items = [{key: record[key] for key in (
+        "arn", "createdAt", "id", "status", "updatedAt"
+    ) if key in record} for record in _memories.values()]
+    page, error = _memory_page(items, data, default=10)
+    if error:
+        return error
+    return json_response({
+        "memories": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
+
+
+def _update_memory(memory_id, body):
+    record = _memories.get(memory_id)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    data = _parse_body(body)
+    now = int(time.time())
+    if "eventExpiryDuration" in data:
+        duration = data["eventExpiryDuration"]
+        if not isinstance(duration, int) or isinstance(duration, bool) or not 3 <= duration <= 365:
+            return _validation("eventExpiryDuration must be an integer from 3 to 365")
+    if "memoryStrategies" in data:
+        strategies, error = _modify_memory_strategies(record, data["memoryStrategies"], now)
+        if error:
+            return error
+        record["strategies"] = strategies
+    if "eventExpiryDuration" in data:
+        record["eventExpiryDuration"] = data["eventExpiryDuration"]
+    if "description" in data:
+        record["description"] = data["description"]
+    for field in ("memoryExecutionRoleArn", "namespaceKeys", "streamDeliveryResources"):
+        if field in data:
+            record[field] = copy.deepcopy(data[field])
+    if data.get("addIndexedKeys"):
+        existing = {item.get("key") for item in record.get("indexedKeys", [])}
+        record.setdefault("indexedKeys", []).extend(
+            copy.deepcopy(item) for item in data["addIndexedKeys"]
+            if item.get("key") not in existing
+        )
+    record["updatedAt"] = now
+    response = _memory_public_record(record)
+    response["status"] = "UPDATING"
+    return json_response({"memory": response}, 202)
+
+
+def _delete_memory(memory_id):
+    record = _memories.pop(memory_id, None)
+    if record is None:
+        return _not_found(f"Memory '{memory_id}' not found")
+    return json_response({"memoryId": memory_id, "status": "DELETING"}, 202)
+
+
+def _version_snapshot(runtime):
+    return {key: copy.deepcopy(value) for key, value in runtime.items()
+            if not key.startswith("_")}
+
+
+def _runtime_versions(runtime):
+    versions = runtime.get("_versions")
+    if versions:
+        return versions
+    current = runtime.get("agentRuntimeVersion", "1")
+    return {current: _version_snapshot(runtime)}
+
+
+def _version_summary(runtime, version):
+    snapshot = _runtime_versions(runtime)[version]
+    return {
+        "agentRuntimeArn": runtime["agentRuntimeArn"],
+        "agentRuntimeId": runtime["agentRuntimeId"],
+        "agentRuntimeVersion": version,
+        "agentRuntimeName": snapshot["agentRuntimeName"],
+        "description": snapshot.get("description", ""),
+        "lastUpdatedAt": _iso(snapshot["lastUpdatedAt"]),
+        "status": snapshot["status"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +603,7 @@ def _create_agent_runtime(body):
                 "filesystemConfigurations"):
         if opt in data:
             record[opt] = data[opt]
+    record["_versions"] = {version: _version_snapshot(record)}
     _runtimes[runtime_id] = record
     # AWS creates the DEFAULT endpoint with the runtime, pointing at the latest version.
     _endpoints[runtime_id] = {"DEFAULT": _endpoint_record(record, "DEFAULT", version)}
@@ -345,15 +619,25 @@ def _create_agent_runtime(body):
     })
 
 
-def _get_agent_runtime(runtime_id):
+def _get_agent_runtime(runtime_id, query_params=None):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
-    out = {k: v for k, v in record.items() if not k.startswith("_")}
+        return _runtime_not_found(runtime_id)
+    version = _agentcore_query_value(query_params, "version")
+    if version is None:
+        selected = record
+    else:
+        selected = _runtime_versions(record).get(str(version))
+        if selected is None:
+            return _not_found(
+                f"Agent runtime version {version} for runtime {runtime_id} not found"
+            )
+    out = {key: value for key, value in selected.items()
+           if not key.startswith("_")}
     return json_response(out)
 
 
-def _list_agent_runtimes(body):
+def _list_agent_runtimes(query_params):
     summaries = []
     for r in _runtimes.values():
         summaries.append({
@@ -365,40 +649,52 @@ def _list_agent_runtimes(body):
             "lastUpdatedAt": _iso(r["lastUpdatedAt"]),
             "status": r["status"],
         })
-    return json_response({"agentRuntimes": summaries})
+    page, error = _paginate_agentcore_results(summaries, query_params)
+    if error:
+        return error
+    return json_response({
+        "agentRuntimes": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
-def _list_agent_runtime_versions(runtime_id, body):
+def _list_agent_runtime_versions(runtime_id, query_params):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
-    summary = {
-        "agentRuntimeArn": record["agentRuntimeArn"],
-        "agentRuntimeId": record["agentRuntimeId"],
-        "agentRuntimeVersion": record["agentRuntimeVersion"],
-        "agentRuntimeName": record["agentRuntimeName"],
-        "description": record.get("description", ""),
-        "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
-        "status": record["status"],
-    }
-    return json_response({"agentRuntimes": [summary]})
+        return _runtime_not_found(runtime_id)
+    items = [
+        _version_summary(record, version)
+        for version in sorted(_runtime_versions(record), key=int, reverse=True)
+    ]
+    page, error = _paginate_agentcore_results(items, query_params)
+    if error:
+        return error
+    return json_response({
+        "agentRuntimes": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
 def _update_agent_runtime(runtime_id, body):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     data = _parse_body(body)
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
         if not data.get(field):
             return _validation(f"{field} is required")
+
+    versions = record.get("_versions")
+    if not versions:
+        versions = {
+            record.get("agentRuntimeVersion", "1"): _version_snapshot(record)
+        }
+        record["_versions"] = versions
+
     _stop_container(runtime_id)
     now = now_iso()
     new_version = str(int(record["agentRuntimeVersion"]) + 1)
     record["agentRuntimeVersion"] = new_version
-    default = (_endpoints.get(runtime_id) or {}).get("DEFAULT")
-    if default:
-        default.update(targetVersion=new_version, liveVersion=new_version, lastUpdatedAt=now)
     record["lastUpdatedAt"] = now
     record["status"] = "READY"
     for field in ("agentRuntimeArtifact", "roleArn", "networkConfiguration"):
@@ -409,6 +705,11 @@ def _update_agent_runtime(runtime_id, body):
                 "filesystemConfigurations"):
         if opt in data:
             record[opt] = data[opt]
+
+    versions[new_version] = _version_snapshot(record)
+    default = (_endpoints.get(runtime_id) or {}).get("DEFAULT")
+    if default:
+        default.update(targetVersion=new_version, liveVersion=new_version, lastUpdatedAt=now)
     return json_response({
         "agentRuntimeArn": record["agentRuntimeArn"],
         "agentRuntimeId": runtime_id,
@@ -423,7 +724,7 @@ def _update_agent_runtime(runtime_id, body):
 def _delete_agent_runtime(runtime_id):
     record = _runtimes.get(runtime_id)
     if record is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     _stop_container(runtime_id)
     _resource_policies.pop(record["agentRuntimeArn"], None)
     for endpoint in (_endpoints.get(runtime_id) or {}).values():
@@ -440,15 +741,18 @@ def _delete_agent_runtime(runtime_id):
 def _create_agent_runtime_endpoint(runtime_id, body):
     runtime = _runtimes.get(runtime_id)
     if runtime is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     data = _parse_body(body)
     name = data.get("name")
     if not name or not _NAME_RE.match(name):
         return _validation("name must match ^[a-zA-Z][a-zA-Z0-9_]{0,47}$")
-    endpoints = _endpoints.setdefault(runtime_id, {})
+    endpoints = _endpoints.get(runtime_id) or {}
     if name in endpoints:
         return _conflict(f"Endpoint {name} already exists")
-    target_version = data.get("agentRuntimeVersion") or runtime["agentRuntimeVersion"]
+    target_version = str(data.get("agentRuntimeVersion") or runtime["agentRuntimeVersion"])
+    if target_version not in _runtime_versions(runtime):
+        return _validation(f"Agent runtime version {target_version} does not exist")
+    endpoints = _endpoints.setdefault(runtime_id, {})
     record = _endpoint_record(runtime, name, target_version, data.get("description", ""))
     now = record["createdAt"]
     endpoints[name] = record
@@ -481,9 +785,9 @@ def _get_agent_runtime_endpoint(runtime_id, endpoint_name):
     })
 
 
-def _list_agent_runtime_endpoints(runtime_id, body):
+def _list_agent_runtime_endpoints(runtime_id, query_params):
     if _runtimes.get(runtime_id) is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     endpoints = _endpoints.get(runtime_id) or {}
     items = []
     for record in endpoints.values():
@@ -499,23 +803,32 @@ def _list_agent_runtime_endpoints(runtime_id, body):
             "createdAt": _iso(record["createdAt"]),
             "lastUpdatedAt": _iso(record["lastUpdatedAt"]),
         })
-    return json_response({"runtimeEndpoints": items})
+    page, error = _paginate_agentcore_results(items, query_params)
+    if error:
+        return error
+    return json_response({
+        "runtimeEndpoints": page["items"],
+        **({"nextToken": page["nextToken"]} if "nextToken" in page else {}),
+    })
 
 
 def _update_agent_runtime_endpoint(runtime_id, endpoint_name, body):
     runtime = _runtimes.get(runtime_id)
     if runtime is None:
-        return _not_found(f"Agent runtime {runtime_id} not found")
+        return _runtime_not_found(runtime_id)
     record = (_endpoints.get(runtime_id) or {}).get(endpoint_name)
     if record is None:
         return _not_found(f"Endpoint {endpoint_name} not found")
     data = _parse_body(body)
-    now = now_iso()
-    if data.get("agentRuntimeVersion"):
-        record["targetVersion"] = data["agentRuntimeVersion"]
-        record["liveVersion"] = data["agentRuntimeVersion"]
+    if data.get("agentRuntimeVersion") is not None:
+        version = str(data["agentRuntimeVersion"])
+        if version not in _runtime_versions(runtime):
+            return _validation(f"Agent runtime version {version} does not exist")
+        record["targetVersion"] = version
+        record["liveVersion"] = version
     if "description" in data:
         record["description"] = data["description"]
+    now = now_iso()
     record["lastUpdatedAt"] = now
     record["status"] = "READY"
     return json_response({
@@ -693,12 +1006,14 @@ def _invoke_agent_runtime(runtime_arn, headers, body, query_params=None):
     if runtime is None:
         return _not_found(f"Agent runtime {runtime_arn} not found")
 
-    qualifier = query_params.get("qualifier") if query_params else None
-    if isinstance(qualifier, list):
-        qualifier = qualifier[0] if qualifier else None
+    qualifier = _agentcore_query_value(query_params, "qualifier")
     endpoint = _endpoint_for_qualifier(runtime, owner_account, owner_region, qualifier)
     if qualifier and endpoint is None:
         return _not_found(f"Agent runtime endpoint {qualifier} not found")
+    version = (endpoint or {}).get("liveVersion") or runtime["agentRuntimeVersion"]
+    selected = _runtime_versions(runtime).get(str(version))
+    if selected is None:
+        return _not_found(f"Agent runtime version {version} for runtime {runtime['agentRuntimeId']} not found")
 
     from ministack.app import AUTH
     from ministack.core.iam_evaluator import caller_arn, pin_request_caller
@@ -714,7 +1029,7 @@ def _invoke_agent_runtime(runtime_arn, headers, body, query_params=None):
         )
 
     with request_scope(owner_account, owner_region):
-        return _invoke_agent_runtime_in_owner(runtime, headers, body)
+        return _invoke_agent_runtime_in_owner(selected, headers, body)
 
 
 def _invoke_agent_runtime_in_owner(runtime, headers, body):
@@ -782,8 +1097,8 @@ def _docker_client():
     return _docker
 
 
-def _container_key(runtime_id):
-    return get_account_id(), get_region(), runtime_id
+def _container_key(runtime_id, version):
+    return get_account_id(), get_region(), runtime_id, str(version)
 
 
 def _remove_container(container):
@@ -808,9 +1123,9 @@ def _remove_orphan_containers(client, labels):
 
 def _stop_container(runtime_id):
     with _container_lock:
-        container = _containers.pop(_container_key(runtime_id), None)
-        if container is not None:
-            _remove_container(container)
+        prefix = _container_key(runtime_id, "")[:3]
+        for key in [key for key in _containers if key[:3] == prefix]:
+            _remove_container(_containers.pop(key))
 
 
 def _container_invocations_url(runtime):
@@ -819,7 +1134,7 @@ def _container_invocations_url(runtime):
     image = artifact.get("containerUri")
     if not isinstance(image, str) or not image:
         raise ValueError("Agent runtime has no containerConfiguration.containerUri")
-    key = _container_key(runtime["agentRuntimeId"])
+    key = _container_key(runtime["agentRuntimeId"], runtime["agentRuntimeVersion"])
     with _container_lock:
         container = _containers.get(key)
         if container is not None:
@@ -837,6 +1152,7 @@ def _container_invocations_url(runtime):
 
             labels = own_labels("agentcore", **{
                 "ministack.agentcore.runtime": runtime["agentRuntimeId"],
+                "ministack.agentcore.runtime-version": runtime["agentRuntimeVersion"],
                 "ministack.agentcore.account": key[0],
                 "ministack.agentcore.region": key[1]})
             try:
@@ -947,6 +1263,22 @@ def _invoke_container(url, body, headers, content_type, session_id):
 
 async def handle_request(method, path, headers, body, query_params):
     inner = path.strip("/")
+    if inner == "memories" and method == "POST":
+        return _list_memories(body)
+    if inner == "memories/create" and method == "POST":
+        return _create_memory(body)
+    if inner.startswith("memories/"):
+        memory_id, _, op = unquote(inner[len("memories/"):]).rpartition("/")
+        handler = {("GET", "details"): lambda: _get_memory(memory_id, query_params),
+                   ("PUT", "update"): lambda: _update_memory(memory_id, body),
+                   ("DELETE", "delete"): lambda: _delete_memory(memory_id)}.get((method, op))
+        if handler:
+            if not _MEMORY_ID_RE.fullmatch(memory_id):
+                return _validation(
+                    f"1 validation error detected: Value '{memory_id}' at 'memoryId' failed to "
+                    f"satisfy constraint: Member must satisfy regular expression pattern: "
+                    f"{_MEMORY_ID_RE.pattern}")
+            return handler()
     if inner.startswith("resourcepolicy/"):
         resource_arn = unquote(inner[len("resourcepolicy/"):])
         if method == "PUT":
@@ -980,11 +1312,11 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "PUT":
             return _create_agent_runtime(body)
         if method == "POST":
-            return _list_agent_runtimes(body)
+            return _list_agent_runtimes(query_params)
     elif n == 2:
         runtime_id = unquote(parts[1])
         if method == "GET":
-            return _get_agent_runtime(runtime_id)
+            return _get_agent_runtime(runtime_id, query_params)
         if method == "PUT":
             return _update_agent_runtime(runtime_id, body)
         if method == "DELETE":
@@ -997,12 +1329,12 @@ async def handle_request(method, path, headers, body, query_params):
             )
         runtime_id = unquote(parts[1])
         if seg == "versions" and method == "POST":
-            return _list_agent_runtime_versions(runtime_id, body)
+            return _list_agent_runtime_versions(runtime_id, query_params)
         if seg == "runtime-endpoints":
             if method == "PUT":
                 return _create_agent_runtime_endpoint(runtime_id, body)
             if method == "POST":
-                return _list_agent_runtime_endpoints(runtime_id, body)
+                return _list_agent_runtime_endpoints(runtime_id, query_params)
     elif n == 4 and parts[2] == "runtime-endpoints":
         runtime_id = unquote(parts[1])
         endpoint_name = unquote(parts[3])
