@@ -134,7 +134,69 @@ def test_tenant_invalid_and_missing_resources(sesv2):
     sesv2.delete_tenant(TenantName=name)
 
 
+@pytest.mark.parametrize("filters,message", [
+    ({"INVALID": "template"},
+     "1 validation error detected: Value at 'filter' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy enum value set: [RESOURCE_TYPE]]"),
+    ({"RESOURCE_TYPE": "bogus"}, "Invalid resource type bogus specified."),
+    ({"RESOURCE_TYPE": "template,configuration-set"},
+     "Invalid resource type template,configuration-set specified."),
+])
+def test_tenant_resource_filter_errors(sesv2, filters, message):
+    name = "tenant-filter-" + uuid.uuid4().hex[:10]
+    sesv2.create_tenant(TenantName=name)
+    _error(sesv2, "list_tenant_resources", "BadRequestException", message,
+           TenantName=name, Filter=filters)
+    sesv2.delete_tenant(TenantName=name)
+
+
+def test_tenant_sending_status_filter(sesv2):
+    name = "tenant-status-" + uuid.uuid4().hex[:10]
+    sesv2.create_tenant(TenantName=name)
+    _error(sesv2, "list_tenants", "BadRequestException", "Invalid sending status <bogus>.",
+           Filter={"TENANT_NAME_CONTAINS": name, "SENDING_STATUS": "bogus"})
+    for status in ("REINSTATED", "DISABLED"):
+        assert sesv2.list_tenants(Filter={"TENANT_NAME_CONTAINS": name, "SENDING_STATUS": status})["Tenants"] == []
+    sesv2.delete_tenant(TenantName=name)
+
+
+def test_tenant_template_association_and_delete_with_associations(sesv2):
+    name = "tenant-template-" + uuid.uuid4().hex[:10]
+    sesv2.create_email_template(TemplateName=name, TemplateContent={"Subject": "probe", "Text": "probe"})
+    sesv2.create_configuration_set(ConfigurationSetName=name)
+    template_arn = f"arn:aws:ses:us-east-1:000000000000:template/{name}"
+    config_arn = f"arn:aws:ses:us-east-1:000000000000:configuration-set/{name}"
+    tenants = [name + suffix for suffix in ("-a", "-b")]
+    for tenant_name in tenants:
+        sesv2.create_tenant(TenantName=tenant_name)
+        for arn in (config_arn, template_arn):
+            sesv2.create_tenant_resource_association(TenantName=tenant_name, ResourceArn=arn)
+        assert sesv2.list_tenant_resources(TenantName=tenant_name, Filter={"RESOURCE_TYPE": "template"})["TenantResources"] == [
+            {"ResourceType": "template", "ResourceArn": template_arn}
+        ]
+        first = sesv2.list_tenant_resources(TenantName=tenant_name, PageSize=1)
+        second = sesv2.list_tenant_resources(TenantName=tenant_name, PageSize=1, NextToken=first["NextToken"])
+        assert first["TenantResources"] + second["TenantResources"] == [
+            {"ResourceType": "configuration-set", "ResourceArn": config_arn},
+            {"ResourceType": "template", "ResourceArn": template_arn},
+        ]
+        assert "NextToken" not in second
+    first = sesv2.list_resource_tenants(ResourceArn=config_arn, PageSize=1)
+    second = sesv2.list_resource_tenants(ResourceArn=config_arn, PageSize=1, NextToken=first["NextToken"])
+    assert [item["TenantName"] for item in first["ResourceTenants"] + second["ResourceTenants"]] == tenants
+    assert "NextToken" not in second
+    sesv2.delete_tenant(TenantName=tenants[0])
+    assert [item["TenantName"] for item in sesv2.list_resource_tenants(ResourceArn=config_arn)["ResourceTenants"]] == tenants[1:]
+    _error(sesv2, "delete_configuration_set", "BadRequestException",
+           f"Cannot delete <{config_arn}> because it has tenant associations. Remove all tenant associations and try again.",
+           ConfigurationSetName=name)
+    sesv2.delete_tenant(TenantName=tenants[1])
+    assert sesv2.list_resource_tenants(ResourceArn=config_arn)["ResourceTenants"] == []
+    sesv2.delete_configuration_set(ConfigurationSetName=name)
+    sesv2.delete_email_template(TemplateName=name)
+
+
 def test_tenant_state_roundtrip_and_account_region_isolation():
+    from ministack.core.persistence import _json_default, _json_object_hook
     from ministack.services import ses_v2
 
     snapshot = copy.deepcopy(ses_v2.get_state())
@@ -161,7 +223,8 @@ def test_tenant_state_roundtrip_and_account_region_isolation():
                 "POST", "/tenants/resources", {"TenantName": "same", "ResourceArn": arn}
             )[0] == 200
 
-        saved = ses_v2.get_state()
+        encoded = json.dumps(ses_v2.get_state(), default=_json_default, sort_keys=True)
+        saved = json.loads(encoded, object_hook=_json_object_hook)
         ses_v2.reset()
         for account, region in scopes:
             set_request_account_id(account)
@@ -169,6 +232,7 @@ def test_tenant_state_roundtrip_and_account_region_isolation():
             assert not ses_v2._tenants
             assert not ses_v2._tenant_resources
         ses_v2.load_persisted_state(saved)
+        assert json.dumps(ses_v2.get_state(), default=_json_default, sort_keys=True) == encoded
         for account, region in scopes:
             set_request_account_id(account)
             set_request_region(region)

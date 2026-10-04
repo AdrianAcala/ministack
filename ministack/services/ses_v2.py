@@ -401,6 +401,9 @@ def _tenant_request(method, sub, data):
                 "BadRequestException",
                 "1 validation error detected: Value at 'filter' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy enum value set: [SENDING_STATUS, TENANT_NAME_CONTAINS]]",
             )
+        status = filters.get("SENDING_STATUS")
+        if status is not None and status not in ("ENABLED", "REINSTATED", "DISABLED"):
+            return _json_err("BadRequestException", f"Invalid sending status <{status}>.")
         items = [
             {k: v for k, v in rec.items() if k != "Tags"}
             for rec in _tenants.values()
@@ -433,6 +436,14 @@ def _tenant_request(method, sub, data):
     if sub == "/tenants/resources/list":
         items = [{"ResourceType": parse_arn(arn).resource.split("/")[0], "ResourceArn": arn} for arn in resources]
         filters = data.get("Filter") or {}
+        if filters.keys() - {"RESOURCE_TYPE"}:
+            return _json_err(
+                "BadRequestException",
+                "1 validation error detected: Value at 'filter' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy enum value set: [RESOURCE_TYPE]]",
+            )
+        resource_type = filters.get("RESOURCE_TYPE")
+        if resource_type is not None and resource_type not in ("configuration-set", "identity", "template"):
+            return _json_err("BadRequestException", f"Invalid resource type {resource_type} specified.")
         items = [
             item
             for item in items
