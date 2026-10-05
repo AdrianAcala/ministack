@@ -5375,6 +5375,11 @@ def _modify_db_instance(p):
         return engine_version_error
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
+    standalone = not (
+        instance.get("DBClusterIdentifier")
+        or instance.get("_shared_cluster_id")
+        or instance.get("Engine", "").startswith("aurora")
+    )
 
     field_map = {
         "DBInstanceClass": "DBInstanceClass",
@@ -5415,7 +5420,11 @@ def _modify_db_instance(p):
                            "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
             val = val == "true"
 
-        if apply_immediately:
+        # These standalone settings take effect immediately and never enter
+        # PendingModifiedValues, regardless of ApplyImmediately (RDS settings).
+        if apply_immediately or (
+            standalone and param_key in ("DeletionProtection", "CopyTagsToSnapshot")
+        ):
             instance[instance_key] = val
         else:
             pending[instance_key] = val

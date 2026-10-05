@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **RDS — standalone deletion protection and snapshot-tag settings apply immediately** — `ModifyDBInstance` now applies `DeletionProtection` and `CopyTagsToSnapshot` regardless of `ApplyImmediately`, returning the active values without adding these fields to `PendingModifiedValues`. Omitted settings keep their existing values.
 - **OpenSearch — data-plane containers are named per account** — a domain's container was named `ministack-opensearch-<region>-<domain>`, so a second account creating a domain of the same name (including an account on another MiniStack sharing the Docker daemon) failed with a Docker name conflict, and the failed create's cleanup removed containers by that name. The names now carry an account and region hash, as RDS's do. Contributed by @skialpine.
 - **RDS — a MySQL master user started in the background keeps its admin grant** — an instance whose engine image was not cached yet, or one respawned on restore, started on a background path that skipped the master-user grant the inline path gives, so the master user held only its own database and `SET PERSIST` failed for lack of `SYSTEM_VARIABLES_ADMIN`. Both paths now grant it. Contributed by @skialpine.
 ### Added
