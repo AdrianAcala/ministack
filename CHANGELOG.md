@@ -7,6 +7,18 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Aurora DSQL — partial indexes** — `CREATE INDEX ASYNC ... WHERE predicate` was refused `0A000` although the service supports it since 2026-09-15; the predicate now reaches the backend and builds a real partial index (unique partial indexes scope uniqueness to the rows they cover). A predicate calling a volatile function fails at submit with `42P17` "functions in index predicate must be marked IMMUTABLE", and a subquery with `0A000`, instead of coming back as a failed job; both are checked in the order the live service uses (eu-central-1, 2026-10-04). Contributed by @vivedo.
+- **Aurora DSQL — `dsql.enable_batched_nestloop` and the reserved `dsql.` prefix** — the session setting added with batched nested-loop joins (2026-09-11) shows `on` before any `SET`, `RESET` returns to `on`, and a non-Boolean value (through `SET` or `set_config`) or a value list is refused `22023` in the service's wording. Any other `dsql.*` name is refused `42602` with the service's "reserved prefix" detail, and `work_mem`, `statement_timeout` and `default_statistics_target` can no longer be set (`0A000`), as on the live service. Plans stay Postgres-shaped: no `Nested Loop (Batched Join)` node. Contributed by @vivedo.
+- **Aurora DSQL — extended statistics limits** — `CREATE STATISTICS` reached the backend without a cap; a sixth object on a table now fails with the service's `54000` "more than 5 extended statistics per table are not allowed", after the statement's own errors and with `IF NOT EXISTS` on an existing name still a no-op. Statistics targets above 100 are refused (`22023`) and `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS` is refused (`0A000`), in the service's wordings. Contributed by @vivedo.
+
+### Fixed
+
+- **Aurora DSQL — the 8-key index limit comes first** — measured live, DSQL reports `54011` before the mode, key-expression and `INCLUDE` rules; the proxy reported those first, so a plain `CREATE INDEX` on nine columns drew "unsupported mode". `sys.jobs.details` is now NULL for a job that succeeded, where it was an empty string. Contributed by @vivedo.
+- **Aurora DSQL — `CALL sys.wait_for_job($1)` with a bound job id** — a job id bound as a parameter over the extended protocol went through to the backing Postgres and failed `3F000` schema "sys" does not exist, after the index had been built. Bound job ids now work for `sys.wait_for_job` and for `sys.jobs ... WHERE job_id = $1`, and `CALL` answers the procedure's `succeeded` column with the `CALL` tag, as measured on the live service (eu-central-1, 2026-10-04); a malformed id is refused `22P02`. `CREATE INDEX ASYNC` and `ALTER TABLE ASYNC` answer the `CREATE INDEX` / `ALTER TABLE` tags, `sys.jobs` declares its `oid` and `timestamptz` columns, a constraint validation job carries `class_id` 2606, and a unique index that fails on duplicates reports the service's `details`. Contributed by @vivedo.
+- **Aurora DSQL — `TimeZone` missing at startup** — the proxy's startup greeting reported no `TimeZone`, so a driver that decodes `timestamptz` by it could stall on the first value; it now reports `TimeZone`, `IntervalStyle` and the rest of the parameters the live service does. Contributed by @vivedo.
+
 ### Fixed
 
 - **Lambda — throttle `retryAfterSeconds` is a string** — a `TooManyRequestsException` returns `retryAfterSeconds` as a string, as the Lambda API model declares, so SDK clients such as the AWS SDK for Rust parse the response as a throttle.
