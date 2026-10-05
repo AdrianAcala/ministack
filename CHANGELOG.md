@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway — `GetApiKeys` filters by `nameQuery`** — `GetApiKeys` ignored `nameQuery` and returned all the API keys, so a lookup by name could get the wrong key. It now returns only the keys whose names start with `nameQuery`.
 - **RDS — creating an existing parameter group is refused** — `CreateDBParameterGroup` and `CreateDBClusterParameterGroup` with a name already in use replaced the group with an empty one, dropping its parameters; they now return `DBParameterGroupAlreadyExists`, as AWS does. Contributed by @skialpine.
 - **RDS — a backup retention period of 0 turns binary logging off** — on RDS for MySQL, `BackupRetentionPeriod=0` turns binary logging off; MiniStack's MySQL 8.0/8.4 instances kept the image default, binary logging on. Such an instance now starts with binary logging off. Contributed by @skialpine.
 - **IoT — `CreateThingGroup` on an existing name returns the group when nothing differs** — a repeated `CreateThingGroup` always failed with `ResourceAlreadyExistsException`. It now returns the existing group's name, ARN and id when the description, attributes (in any order), parent and tags match, and answers 409 with AWS's message otherwise, leaving the group unchanged, as AWS does. An `AWS::IoT::ThingGroup` that names an existing group still fails its stack, with or without matching properties, now with AWS's name-conflict message. Contributed by @iot-rocket.
