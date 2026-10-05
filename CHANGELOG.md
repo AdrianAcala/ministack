@@ -21,6 +21,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway v2 — JWT claims reach a Lambda as strings** — `requestContext.authorizer.jwt.claims` holds every claim as a string, as on AWS: numbers as digits, booleans as `true`/`false` and arrays as their items in brackets, e.g. `[admin dev]`. Typed event models (for example `aws_lambda_events` in Rust, or Go's `map[string]string`) parse the event.
 - **Lambda — throttle `retryAfterSeconds` is a string** — a `TooManyRequestsException` returns `retryAfterSeconds` as a string, as the Lambda API model declares, so SDK clients such as the AWS SDK for Rust parse the response as a throttle.
 - **Step Functions — `States.TaskFailed` no longer matches `States.Timeout`** — a `Retry` or `Catch` on `States.TaskFailed` also matched a timeout, so a state machine retried or caught a timeout where AWS does not. `States.TaskFailed` now matches every error except `States.Timeout`, as the Step Functions error handling guide describes.
 - **AppConfig — predefined deployment strategies** — `AppConfig.AllAtOnce`, `AppConfig.Linear50PercentEvery30Seconds`, `AppConfig.Canary10Percent20Minutes` and `AppConfig.Linear20PercentEvery6Minutes` now exist in every account and region and cannot be updated or deleted, as on AWS. A deployment records its strategy's parameters, and `StartDeployment` and `AWS::AppConfig::Deployment` fail with `ResourceNotFoundException` for a strategy that does not exist, where they used to accept any id. Contributed by @koh-sh.
