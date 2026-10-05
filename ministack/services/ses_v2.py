@@ -297,6 +297,82 @@ def _local_ses_v2_resource_arn(arn):
     return str(spec), None
 
 
+def _valid_tag_identity_name(name):
+    """SES uses different lexical checks for domain and email identifiers."""
+    local, separator, domain = name.rpartition("@")
+    if separator:
+        return bool(
+            re.fullmatch(r'''(?:[A-Za-z0-9.!#$%&'*+/=?^_`{|}~\\-]+|"[^"\r\n]*")''', local)
+            and re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*", domain)
+        )
+    labels = name.split(".")
+    return bool(
+        len(name) <= 253
+        and re.match(r"[A-Za-z]", labels[-1])
+        and all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?", label) for label in labels)
+    )
+
+
+def _tag_read_resource_arn(arn):
+    """SES checks existence at the endpoint, but looks up tags by the ARN."""
+    invalid = _json_err("BadRequestException", "ResourceArn is not the expected format")
+    try:
+        spec = parse_arn(arn)
+    except (ArnParseError, TypeError):
+        return None, invalid
+    kind, sep, name = spec.resource.partition("/")
+    labels = {"identity": "EmailIdentity", "configuration-set": "ConfigurationSet", "template": "Template"}
+    if not spec.partition or not spec.service or not sep:
+        return None, invalid
+    # Identity identifiers have their own parser and error, including email
+    # local parts containing slashes. Other resources use the generic ARN shape.
+    if kind == "identity":
+        if (
+            spec.service != "ses"
+            or not re.fullmatch(r"[0-9]{12}", spec.account_id)
+            or not _valid_tag_identity_name(name)
+        ):
+            return None, _json_err("BadRequestException", "Provided resource identifier is not an SES resource")
+    elif (
+        not spec.account_id or not name.strip() or ":" in name
+        or (kind in labels and "/" in name)
+    ):
+        return None, invalid
+    # Resource handlers can extend the local resolver independently. Use the
+    # endpoint's scope for existence checks; the original ARN remains the tag key.
+    local_arn = _resource_arn(kind, name)
+    if kind == "identity":
+        err = None if name in _identities else _not_found_resource_arn(local_arn)
+    elif kind == "template":
+        err = None if name in _templates else _not_found_resource_arn(local_arn)
+    else:
+        _, err = _local_ses_v2_resource_arn(local_arn)
+    if err and err[0] == 400:
+        return None, invalid
+    if spec.account_id != get_account_id():
+        return None, _json_err(
+            "BadRequestException", "Operations on a resource created in a different account is not allowed"
+        )
+    if kind == "configuration-set" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        return None, (
+            400,
+            {"Content-Type": "application/x-amz-json-1.1", "x-amzn-errortype": "ValidationException"},
+            b"",
+        )
+    if kind == "template" and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name):
+        return None, _json_err(
+            "BadRequestException",
+            "Template name can contain alphanumeric characters, underscores(_) and hyphens(-). "
+            "It can contain up to 128 characters and it should start with an alphanumeric character.",
+        )
+    if err:
+        if kind in labels:
+            return None, _json_err("NotFoundException", f"No {labels[kind]} present with name: {name}", 404)
+        return None, err
+    partition = "aws" if kind in labels else spec.partition
+    return f"arn:{partition}:ses:{spec.region}:{spec.account_id}:{spec.resource}", None
+
+
 async def handle_request(method, path, headers, body, query_params):
     # The SES dispatcher also accepts unprefixed REST paths when selected by
     # a SESv2 target header. Preserve those paths and trailing-slash handling
@@ -587,9 +663,16 @@ async def handle_request(method, path, headers, body, query_params):
     if m:
         name = m.group(1)
         if method == "GET":
+            if len(name) > 64:
+                return _json_err("BadRequestException", "Configuration set name cannot exceed 64 characters.")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                return _json_err(
+                    "BadRequestException",
+                    f"Invalid configuration set name <{name}>: only alphanumeric ASCII characters, '_', and '-' are allowed.",
+                )
             rec = _config_sets.get(name)
             if not rec:
-                return _json_err("NotFoundException", f"ConfigurationSet {name} not found", 404)
+                return _json_err("NotFoundException", f"Configuration set <{name}> does not exist.", 404)
             return json_response(rec)
         if method == "DELETE":
             _config_sets.pop(name, None)
@@ -658,8 +741,10 @@ async def handle_request(method, path, headers, body, query_params):
 
     # GET/POST/DELETE /v2/email/tags  (ListTagsForResource / TagResource / UntagResource)
     if sub == "/tags" and method == "GET":
+        if "ResourceArn" not in query_params:
+            return _json_err("InternalFailure", None, 500)
         arn = _first_query_value(query_params, "ResourceArn")
-        canonical_arn, err = _local_ses_v2_resource_arn(arn)
+        canonical_arn, err = _tag_read_resource_arn(arn)
         if err:
             return err
         return json_response({"Tags": _ses_tags.get(canonical_arn, [])})

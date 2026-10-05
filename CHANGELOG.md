@@ -7,6 +7,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **SES v2 — configuration-set and tag readback errors** — `ListTagsForResource` matches AWS-observed errors for malformed or omitted ARNs, account mismatches and invalid identity, configuration-set and template names. Resource existence is checked in the endpoint region; tag lookup preserves the requested ARN region while normalizing the partition and service. `GetConfigurationSet` validates names and reports the AWS missing-resource message.
+
 ## [1.5.22] — 2026-10-05
 
 ### Added

@@ -294,8 +294,19 @@ def test_ses_v2_tag_apis_reject_invalid_resource_arns_before_touching_tags(ses_v
     else:
         status, body = _call(ses_v2, method, query={"ResourceArn": [bad_arn]})
 
-    assert status == 400
-    assert body["name"] == "BadRequestException"
+    if method == "GET" and bad_arn in (
+        _arn("identity", identity, partition="aws-cn"),
+        _arn("identity", identity, region="us-west-2"),
+    ):
+        assert status == 200
+        assert body["Tags"] == ([{"Key": "keep", "Value": "yes"}]
+                                if ":aws-cn:" in bad_arn else [])
+    elif method == "GET" and bad_arn == _arn("template", "parser-template"):
+        assert status == 404
+        assert body["name"] == "NotFoundException"
+    else:
+        assert status == 400
+        assert body["name"] == "BadRequestException"
     assert ses_v2._ses_tags.get(bad_arn) is None
 
     status, body = _call(ses_v2, "GET", query={"ResourceArn": [valid_arn]})
@@ -708,3 +719,27 @@ def test_ses_v2_send_bulk_email_rejects_missing_template_without_recording_sends
     assert status == 404
     assert body["name"] == "NotFoundException"
     assert ses_v2._sent_emails_list() == []
+
+
+@pytest.mark.parametrize('query,status,code,message', [
+    ({}, 500, 'InternalFailure', None),
+    ({'ResourceArn': ['']}, 400, 'BadRequestException', 'ResourceArn is not the expected format'),
+])
+def test_ses_v2_tag_read_distinguishes_omitted_and_empty_arn(ses_v2, query, status, code, message):
+    actual_status, headers, body = asyncio.run(
+        ses_v2.handle_request('GET', '/v2/email/tags', {}, b'', query)
+    )
+    assert actual_status == status
+    assert headers['x-amzn-errortype'] == code
+    assert json.loads(body)['message'] == message
+
+
+def test_ses_v2_invalid_configuration_set_tag_name_has_empty_body(ses_v2):
+    arn = _arn('configuration-set', 'bad name')
+    status, headers, body = asyncio.run(
+        ses_v2.handle_request('GET', '/v2/email/tags', {}, b'', {'ResourceArn': [arn]})
+    )
+    assert status == 400
+    assert headers['x-amzn-errortype'] == 'ValidationException'
+    assert headers['Content-Type'] == 'application/x-amz-json-1.1'
+    assert body == b''
