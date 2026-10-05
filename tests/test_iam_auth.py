@@ -4167,3 +4167,17 @@ def test_trust_denies_and_conditions_remain_permissive_without_auth(trust_api, m
     monkeypatch.setattr(app_mod, "AUTH", False)
     _install_policy(trust_api, operation, policy)
     _assume(trust_api, 200, RoleSessionName="unrestricted")
+
+
+@pytest.mark.parametrize("service, action", [("iam", "iam:ListUsers"), ("sqs", "sqs:ListQueues"), ("sns", "sns:ListTopics")])
+@pytest.mark.parametrize("explicit_deny, reason", [
+    (True, "with an explicit deny in an identity-based policy"),
+    (False, "because no identity-based policy allows the {action} action"),
+])
+def test_access_denied_message_names_an_explicit_deny(service, action, explicit_deny, reason):
+    from ministack.core.iam_actions import access_denied_response
+
+    _status, _headers, body = access_denied_response(
+        service, action, "arn:aws:iam::000000000000:user/u", "req-1", explicit_deny=explicit_deny)
+    expected = f"User: arn:aws:iam::000000000000:user/u is not authorized to perform: {action} "
+    assert (expected + reason.format(action=action)) in body.decode()

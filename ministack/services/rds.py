@@ -895,6 +895,7 @@ def _restore_state(data, *, resume_runtime=False):
                             cluster.get("MasterUsername", "admin"),
                             cluster.get("_MasterUserPassword", "password"),
                             cluster_id,
+                            cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
@@ -2544,7 +2545,7 @@ def _start_rds_container_for_instance(db_id, instance):
             return
         _grant_mysql_master_user_privileges(
             internal_host or "127.0.0.1", internal_port or host_port,
-            master_user, master_pass, db_id,
+            master_user, master_pass, db_id, engine,
         )
     _instance_available_unless_stopped(instance)
     logger.info("RDS: respawned container %s for instance %s",
@@ -2626,17 +2627,12 @@ def _is_mysql_engine(engine):
     return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
 
 
-# A DB parameter group name that is also a server variable (RDS-only names such
-# as `rds.force_ssl` are not).
+# Excludes RDS-only names such as `rds.force_ssl`.
 _MYSQL_SERVER_PARAMETER = re.compile(r"[A-Za-z0-9_]+")
 
 
 def _mysql_server_options(backup_retention_period, param_group_name=None):
-    """Server options for a standalone MySQL/MariaDB instance, as RDS starts one:
-    a backup retention period of 0 turns binary logging off, and the instance's
-    DB parameter group's set values are server options. `--loose-` keeps a name
-    the server does not know as a startup option (such as `time_zone`) from
-    stopping it; formula values (`{DBInstanceClassMemory*3/4}`) are not evaluated."""
+    """Startup options: retention 0 disables the binlog; group values go as `--loose-` options."""
     options = [] if int(backup_retention_period) > 0 else ["--skip-log-bin"]
     group = _param_groups.get(param_group_name) if param_group_name else None
     for name, param in ((group or {}).get("Parameters") or {}).items():
@@ -2657,15 +2653,7 @@ def _mysql_parameter_value(value):
 
 
 def _apply_parameter_group_changes(group_name, changes, refuse_static=True):
-    """Apply `(name, value, apply_method)` changes to the running MySQL instances
-    in a DB parameter group, as RDS does: an `immediate` change to a dynamic
-    parameter takes effect now (a `None` value resets it to the engine default);
-    a `pending-reboot` change leaves the instance `pending-reboot` until the next
-    start, which applies the whole group (`_mysql_server_options`). An `immediate`
-    change to a static parameter, which the server reports as a read-only
-    variable, is refused as AWS refuses it, before anything is applied; with
-    `refuse_static=False` (a reset) it is left pending-reboot instead. Returns
-    the refusal, or None."""
+    """Apply `(name, value, apply_method)` changes to the group's running MySQL instances; returns a refusal or None."""
     for instance in list(_instances.values()):
         groups = instance.get("DBParameterGroups") or []
         if not (
@@ -3867,8 +3855,39 @@ def _configure_or_defer_mysql_replication(cluster_id, cluster):
         _schedule_mysql_replication_retry(cluster_id, cluster)
 
 
-def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id):
-    """Grant the emulated MySQL master user AWS/RDS-like admin privileges."""
+_MYSQL_MASTER_PRIVILEGES = (
+    "SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, REFERENCES, "
+    "INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, "
+    "REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, "
+    "ALTER ROUTINE, CREATE USER, EVENT, TRIGGER"
+)
+_AURORA_MYSQL_3_MASTER_PRIVILEGES = (
+    "CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "CONNECTION_ADMIN",
+    "ROLE_ADMIN", "XA_RECOVER_ADMIN", "SHOW_ROUTINE", "FLUSH_OPTIMIZER_COSTS",
+    "FLUSH_STATUS", "FLUSH_TABLES", "FLUSH_USER_RESOURCES",
+)
+
+
+def _mysql_master_extra_privileges(engine, server_version):
+    """Master-user privileges beyond _MYSQL_MASTER_PRIVILEGES, per the RDS and Aurora master user tables."""
+    version = tuple(int(n) for n in re.findall(r"\d+", server_version)[:3])
+    if "mariadb" in server_version.lower():
+        return ("SHOW CREATE ROUTINE",) if version >= (11, 4) else ()
+    if engine.startswith("aurora"):
+        if version < (8,):
+            return ("LOAD FROM S3", "SELECT INTO S3")
+        if version >= (8, 4):
+            return _AURORA_MYSQL_3_MASTER_PRIVILEGES + (
+                "ALLOW_NONEXISTENT_DEFINER", "FLUSH_PRIVILEGES", "OPTIMIZE_LOCAL_TABLE", "SET_ANY_DEFINER")
+        return _AURORA_MYSQL_3_MASTER_PRIVILEGES + ("SET_USER_ID",)
+    if version >= (8, 0, 36):
+        return ("CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "ROLE_ADMIN",
+                "SET_USER_ID", "XA_RECOVER_ADMIN")
+    return ()
+
+
+def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id, engine=""):
+    """Grant the emulated MySQL master user the privileges AWS gives it, and no others."""
     try:
         import pymysql
         conn = pymysql.connect(
@@ -3879,13 +3898,17 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
             (master_user, master_pass),
         )
+        if master_user != "root":
+            cur.execute("REVOKE ALL PRIVILEGES, GRANT OPTION FROM %s@'%%'", (master_user,))
         cur.execute(
-            "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
+            f"GRANT {_MYSQL_MASTER_PRIVILEGES} ON *.* TO %s@'%%' WITH GRANT OPTION",
             (master_user,),
         )
-        for privilege in ("APPLICATION_PASSWORD_ADMIN",):
+        cur.execute("SELECT VERSION()")
+        server_version = cur.fetchone()[0]
+        for privilege in _mysql_master_extra_privileges(engine or "", server_version):
             try:
-                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%'", (master_user,))
+                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%' WITH GRANT OPTION", (master_user,))
             except Exception as e:
                 logger.debug(
                     "RDS: MySQL privilege %s unsupported for %s: %s",
@@ -5187,7 +5210,7 @@ def _create_db_instance_impl(p):
                         _grant_mysql_master_user_privileges(
                             ready_host, ready_port, master_user,
                             cluster.get("_MasterUserPassword", master_pass),
-                            cluster_id,
+                            cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
                     if _aurora_mysql_8_replication_enabled(cluster):
@@ -5228,7 +5251,7 @@ def _create_db_instance_impl(p):
             if _is_mysql_engine(engine):
                 _grant_mysql_master_user_privileges(
                     ready_host, ready_port, master_user, master_pass,
-                    cluster_id or db_id,
+                    cluster_id or db_id, engine,
                 )
             inst = _instances.get(db_id)
             if inst is not None:
@@ -5446,6 +5469,12 @@ def _rotate_instance_password(instance, old_pass, new_pass):
                          db_id, e)
 
 
+_IMMEDIATE_INSTANCE_SETTINGS = frozenset({
+    "DeletionProtection", "CopyTagsToSnapshot", "PreferredBackupWindow", "PreferredMaintenanceWindow",
+    "PubliclyAccessible", "MaxAllocatedStorage", "MonitoringInterval", "MonitoringRoleArn",
+})
+
+
 def _modify_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
@@ -5477,11 +5506,6 @@ def _modify_db_instance(p):
         return engine_version_error
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
-    standalone = not (
-        instance.get("DBClusterIdentifier")
-        or instance.get("_shared_cluster_id")
-        or instance.get("Engine", "").startswith("aurora")
-    )
 
     field_map = {
         "DBInstanceClass": "DBInstanceClass",
@@ -5522,11 +5546,8 @@ def _modify_db_instance(p):
                            "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
             val = val == "true"
 
-        # These standalone settings take effect immediately and never enter
-        # PendingModifiedValues, regardless of ApplyImmediately (RDS settings).
-        if apply_immediately or (
-            standalone and param_key in ("DeletionProtection", "CopyTagsToSnapshot")
-        ):
+        # Not PendingModifiedValues members: AWS applies these whatever ApplyImmediately says.
+        if apply_immediately or param_key in _IMMEDIATE_INSTANCE_SETTINGS:
             instance[instance_key] = val
         else:
             pending[instance_key] = val
@@ -7274,7 +7295,7 @@ def _start_db_cluster(p):
                     _grant_mysql_master_user_privileges(
                         ready_host, ready_port, master_user,
                         cluster.get("_MasterUserPassword", master_pass),
-                        cluster_id,
+                        cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
                 if _aurora_mysql_8_replication_enabled(cluster):

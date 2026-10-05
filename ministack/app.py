@@ -2125,7 +2125,8 @@ def _enforce_data_plane(
             return access_denied_response(
                 service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
             )
-        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers)
+        return access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
+                                      explicit_deny=denied.decision == "Deny")
     return None
 
 

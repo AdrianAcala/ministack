@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import hashlib
 import hmac
@@ -115,6 +116,8 @@ def test_cognito_ui_customization(cognito_idp):
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
 
     cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain=f"ui-{pid.split('_')[1].lower()}")
+    assert cognito_idp.get_ui_customization(UserPoolId=pid)["UICustomization"] == {}
+    assert cognito_idp.get_ui_customization(UserPoolId=pid, ClientId=cid)["UICustomization"] == {}
     pool_ui = cognito_idp.set_ui_customization(UserPoolId=pid, CSS=".banner-customizable {}")["UICustomization"]
     assert pool_ui["ClientId"] == "ALL" and pool_ui["CSS"] == ".banner-customizable {}" and pool_ui["CSSVersion"]
     assert cognito_idp.get_ui_customization(UserPoolId=pid, ClientId=cid)["UICustomization"]["CSS"] == pool_ui["CSS"]
@@ -9220,6 +9223,9 @@ def test_cognito_federation_access_token_pretoken_event_has_user_attributes(cogn
     assert access["seen_groups"] == "admins"
 
 
+# Secret-hash checks run under AUTH=true; server tests need a MiniStack started with it.
+_requires_auth = pytest.mark.skipif(os.environ.get("AUTH", "").lower() != "true",
+                                    reason="secret-hash checks need a MiniStack server with AUTH=true")
 def _api_issued_tokens(cognito_idp, pool_name):
     """A pool with a confidential client and a user signed in through InitiateAuth.
 
@@ -9241,7 +9247,8 @@ def _api_issued_tokens(cognito_idp, pool_name):
         UserPoolId=pid, Username="apirefresh", Password="Refresh-Pass1", Permanent=True)
     tokens = cognito_idp.initiate_auth(
         ClientId=client["ClientId"], AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "apirefresh", "PASSWORD": "Refresh-Pass1"},
+        AuthParameters={"USERNAME": "apirefresh", "PASSWORD": "Refresh-Pass1",
+                        "SECRET_HASH": _cognito_secret_hash(client, "apirefresh")},
     )["AuthenticationResult"]
     return pid, client, tokens
 
@@ -9306,6 +9313,19 @@ def test_cognito_oauth2_token_rejects_api_issued_refresh_token_with_wrong_secret
     assert body["error"] == "invalid_client"
 
 
+def test_cognito_oauth2_token_rejects_api_issued_refresh_token_without_secret(cognito_idp):
+    _, client, tokens = _api_issued_tokens(cognito_idp, "OAuthApiRefreshNoSecretPool")
+
+    status, _, body = _post_form(
+        f"{ENDPOINT}/oauth2/token",
+        {"grant_type": "refresh_token", "client_id": client["ClientId"],
+         "refresh_token": tokens["RefreshToken"]},
+    )
+
+    assert status == 400
+    assert json.loads(body)["error"] == "invalid_client"
+
+
 @pytest.mark.parametrize("case", ["garbage", "access_token", "deleted_pool"])
 def test_cognito_oauth2_token_rejects_invalid_refresh_token(cognito_idp, case):
     """A string that is not a refresh token of an existing pool mints no tokens."""
@@ -9347,9 +9367,11 @@ _SECRET_HASH_OPERATIONS = (
 ])
 def test_cognito_secret_hash_dispatch_prevents_side_effects(monkeypatch, action, hash_kind):
     """Refusal precedes user/token changes, code delivery, and Lambda callbacks."""
+    import ministack.app as app_mod
     from ministack.core.responses import AccountRegionScopedDict
 
     mod = _cognito_module()
+    monkeypatch.setattr(app_mod, "AUTH", True)
     # These stores belong to the test process, never the running server.
     monkeypatch.setattr(mod, "_user_pools", AccountRegionScopedDict())
     monkeypatch.setattr(mod, "_refresh_tokens", {})
@@ -9433,6 +9455,28 @@ def test_cognito_secret_hash_dispatch_prevents_side_effects(monkeypatch, action,
     )
 
 
+def test_cognito_secret_hash_not_checked_without_auth(monkeypatch):
+    import ministack.app as app_mod
+    from ministack.core.responses import AccountRegionScopedDict
+
+    mod = _cognito_module()
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    monkeypatch.setattr(mod, "_user_pools", AccountRegionScopedDict())
+    pid = json.loads(mod._create_user_pool({"PoolName": "NoAuthSecret"})[2])["UserPool"]["Id"]
+    cid = json.loads(mod._create_user_pool_client({
+        "UserPoolId": pid, "ClientName": "app", "GenerateSecret": True,
+        "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH"],
+    })[2])["UserPoolClient"]["ClientId"]
+    mod._admin_create_user({"UserPoolId": pid, "Username": "u", "TemporaryPassword": "Correct1!",
+                            "MessageAction": "SUPPRESS"})
+    mod._admin_set_user_password({"UserPoolId": pid, "Username": "u", "Password": "Correct1!", "Permanent": True})
+    status, _, body = asyncio.run(mod._dispatch_idp("InitiateAuth", {
+        "ClientId": cid, "AuthFlow": "USER_PASSWORD_AUTH",
+        "AuthParameters": {"USERNAME": "u", "PASSWORD": "Correct1!"},
+    }))
+    assert status == 200, body
+
+
 def _secret_hash_pool(cognito_idp, **pool_options):
     pid = cognito_idp.create_user_pool(PoolName="SecretHashPool", **pool_options)["UserPool"]["Id"]
     client = cognito_idp.create_user_pool_client(
@@ -9456,6 +9500,7 @@ def _secret_hash_user(cognito_idp, pid, username="canonical-user", permanent=Tru
     return user
 
 
+@_requires_auth
 def test_cognito_secret_hash_self_service(cognito_idp):
     pid, client = _secret_hash_pool(cognito_idp)
     params = {"ClientId": client["ClientId"], "Username": "signup-user",
@@ -9477,6 +9522,7 @@ def test_cognito_secret_hash_self_service(cognito_idp):
     assert cognito_idp.get_user(AccessToken=auth["AuthenticationResult"]["AccessToken"])["Username"] == "signup-user"
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
 @pytest.mark.parametrize("login", ["canonical-user", "alias@example.test"])
 def test_cognito_secret_hash_password_uses_submitted_alias(cognito_idp, admin, login):
@@ -9501,6 +9547,7 @@ def test_cognito_secret_hash_password_uses_submitted_alias(cognito_idp, admin, l
         assert exc.value.response["Error"]["Message"] == f"Unable to verify secret hash for client {client['ClientId']}"
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
 def test_cognito_secret_hash_new_password_challenge(cognito_idp, admin):
     pid, client = _secret_hash_pool(cognito_idp)
@@ -9532,6 +9579,7 @@ def test_cognito_secret_hash_new_password_challenge(cognito_idp, admin):
     assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "canonical-user"
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
 @pytest.mark.parametrize("username_attributes", [False, True], ids=["username-sign-in", "email-sign-in"])
 @pytest.mark.parametrize("flow", ["REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"])
@@ -9566,6 +9614,7 @@ def test_cognito_secret_hash_refresh_uses_token_owner(cognito_idp, admin, userna
     assert cognito_idp.get_user(AccessToken=refreshed["AccessToken"])["Username"] == user["Username"]
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
 def test_cognito_secret_hash_srp_proof(cognito_idp, admin):
     pid, client = _secret_hash_pool(cognito_idp, AliasAttributes=["email"])
@@ -9594,8 +9643,11 @@ def test_cognito_secret_hash_srp_proof(cognito_idp, admin):
     assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "canonical-user"
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
-def test_cognito_secret_hash_custom_challenge(cognito_idp, lam, admin):
+def test_cognito_secret_hash_custom_challenge(cognito_idp, lam, iam, admin):
+    with contextlib.suppress(iam.exceptions.EntityAlreadyExistsException):
+        iam.create_role(RoleName="lambda-role", AssumeRolePolicyDocument="{}")
     pid, client = _secret_hash_pool(cognito_idp)
     _secret_hash_user(cognito_idp, pid)
     suffix = _uuid_mod.uuid4().hex[:8]
@@ -9667,6 +9719,7 @@ def test_cognito_secret_hash_custom_challenge(cognito_idp, lam, admin):
     assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "canonical-user"
 
 
+@_requires_auth
 def test_cognito_secret_hash_admin_sms_challenge(cognito_idp):
     """Existing admin SMS handling must also require the app-client proof."""
     pid, client = _secret_hash_pool(cognito_idp)
@@ -9685,6 +9738,7 @@ def test_cognito_secret_hash_admin_sms_challenge(cognito_idp):
     assert cognito_idp.get_user(AccessToken=result["AccessToken"])["Username"] == "canonical-user"
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
 @pytest.mark.parametrize("include_hash", [False, True], ids=["missing-hash", "wrong-hash"])
 def test_cognito_secret_hash_invalid_refresh_preserves_token_error(cognito_idp, admin, include_hash):
@@ -9705,6 +9759,7 @@ def test_cognito_secret_hash_invalid_refresh_preserves_token_error(cognito_idp, 
     }
 
 
+@_requires_auth
 @pytest.mark.parametrize("admin", [False, True])
 def test_cognito_secret_hash_no_secret_refresh_ignores_supplied_hash(cognito_idp, admin):
     pid = cognito_idp.create_user_pool(PoolName="PublicRefreshHashPool")["UserPool"]["Id"]

@@ -1767,10 +1767,11 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
     if not message:
-        message = (
-            f"User: {principal_arn} is not authorized to perform: {action} "
-            f"because no identity-based policy allows the {action} action"
+        reason = (
+            "with an explicit deny in an identity-based policy" if explicit_deny
+            else f"because no identity-based policy allows the {action} action"
         )
+        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
     code = error_code or "AccessDenied"
     protocol = _SERVICE_PROTOCOL.get(service, "json")
     if service in _CBOR_CAPABLE:

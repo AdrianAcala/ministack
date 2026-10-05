@@ -2269,7 +2269,7 @@ _SECRET_HASH_PARAMETERS = {
 def _validate_client_secret_hash(action: str, data: dict):
     """Authenticate confidential app clients before user changes or triggers.
 
-    This is Cognito's app-client contract, independent of IAM's AUTH flag.
+    Enforced under AUTH=true.
     Refresh authentication uses the token owner's username (or sub for a
     UsernameAttributes pool), rather than the alias used at initial sign-in.
     """
@@ -2340,7 +2340,8 @@ def _validate_client_secret_hash(action: str, data: dict):
 def _run_idp_handler(handler, action: str, data: dict):
     if action in _UNSIGNED_IDP_ACTIONS:
         _pin_unsigned_idp_scope(data)
-    error = _validate_client_secret_hash(action, data)
+    from ministack.app import AUTH
+    error = _validate_client_secret_hash(action, data) if AUTH else None
     if error:
         return error
     return handler(data)
@@ -2859,7 +2860,7 @@ def _get_ui_customization(data):
     if err:
         return err
     ui = pool.get("_ui_customizations", {})
-    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {"UserPoolId": pool["Id"], "ClientId": cid}})
+    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {}})
 
 
 # ---------------------------------------------------------------------------
@@ -6457,7 +6458,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
     """Refresh tokens minted by InitiateAuth / RespondToAuthChallenge never enter
     ``_refresh_tokens`` (that registry only holds Hosted UI grants), yet AWS accepts
     them at /oauth2/token. Validate them with the REFRESH_TOKEN_AUTH core, and the
-    client secret as the registry branch does."""
+    client as the authorization_code branch does."""
     try:
         claims = _decode_id_token_unverified(refresh_val)
     except ValueError:
@@ -6470,7 +6471,7 @@ def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
         return _oauth2_error("invalid_grant", "Invalid refresh token.")
     client_id = cid or str(claims.get("client_id", ""))
     _, _, client = _find_pool_by_client_id(client_id)
-    if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
+    if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
         return _oauth2_error("invalid_client", "Invalid client credentials.")
     result, err = _refresh_auth_result(pool, pid, client_id, refresh_val)
     if err:
