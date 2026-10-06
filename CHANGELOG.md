@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **API Gateway — management IAM actions and resource paths** — with `AUTH=true`, REST and HTTP/WebSocket API management requests use `apigateway:GET`, `POST`, `PUT`, `PATCH` and `DELETE` instead of SDK operation names. Resource ARNs preserve stage names, nested resources and collection paths, and ignore trailing slashes as AWS does, so scoped grants and explicit stage denies apply to the requested resource.
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 
