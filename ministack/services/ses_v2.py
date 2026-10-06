@@ -11,7 +11,7 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           PutAccountSuppressionAttributes, TagResource, UntagResource,
           ListTagsForResource, CreateTenant, GetTenant, ListTenants, DeleteTenant,
           CreateTenantResourceAssociation, DeleteTenantResourceAssociation,
-          ListTenantResources, ListResourceTenants.
+          ListTenantResources, ListResourceTenants, PutTenantSuppressionAttributes.
 Email templates live in the v1 store, so either API version sees the other's.
 """
 
@@ -189,9 +189,15 @@ def _page_size(query_params, default, maximum=100):
         size = int(raw)
     except (TypeError, ValueError):
         return default, _json_err("BadRequestException", f"Invalid PageSize: {raw}")
-    if size < 1 or size > maximum:
+    if size < 1:
         return default, _json_err(
-            "BadRequestException", f"PageSize must be between 1 and {maximum}"
+            "BadRequestException",
+            f"1 validation error detected: Value '{raw}' at 'pageSize' failed to satisfy constraint: Member must have value greater than or equal to 1",
+        )
+    if size > maximum:
+        return default, _json_err(
+            "BadRequestException",
+            f"1 validation error detected: Value '{raw}' at 'pageSize' failed to satisfy constraint: Member must have value less than or equal to {maximum}",
         )
     return size, None
 
@@ -301,6 +307,12 @@ def _local_ses_v2_resource_arn(arn):
             return None, _not_found_resource_arn(arn)
     elif kind == "tenant":
         parts = name.split("/")
+        if len(parts) == 1:
+            return None, _json_err(
+                "NotFoundException",
+                f"No Tenant present with name: nullwith tenantId: {name}",
+                404,
+            )
         if len(parts) != 2 or not all(parts):
             return None, _invalid_resource_arn(arn)
         tenant_name, tenant_id = parts
@@ -326,15 +338,11 @@ def _association_resource(arn):
         spec = parse_arn(arn)
     except (ArnParseError, TypeError):
         return None, _json_err("BadRequestException", "Provided resource identifier is not an SES resource")
+    if spec.service != "ses":
+        return None, _json_err("BadRequestException", "Provided ARN is not in SES resource ARN format")
     kind, _, name = spec.resource.partition("/")
     if kind not in ("configuration-set", "identity", "template"):
         return None, _json_err("BadRequestException", f"Unsupported resource type: {kind}")
-    if spec.service != "ses":
-        pattern = "arn:aws(|-cn|-us-gov|-eusc):ses:[a-z0-9-]{1,20}:[0-9]{12}:(configuration-set|identity|template)/.+"
-        return None, _json_err(
-            "BadRequestException",
-            f"1 validation error detected: Value '{arn}' at 'resourceArn' failed to satisfy constraint: Member must satisfy regular expression pattern: {pattern}",
-        )
     if spec.region != get_region():
         return None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same region")
     if spec.account_id != get_account_id():
@@ -347,6 +355,77 @@ def _association_resource(arn):
     if name not in store:
         return None, _json_err("NotFoundException", f"{label} <{name}> does not exist:", 404)
     return kind, None
+
+
+_SUPPRESSED_REASONS = ("BOUNCE", "COMPLAINT")
+_SUPPRESSION_SCOPES = ("TENANT", "ACCOUNT")
+
+
+def _suppression_enum_errors(prefix, reasons, reasons_present, scope, scope_present):
+    """Model-level enum errors for suppression attributes, in member order."""
+    errors = []
+    if reasons_present:
+        members = reasons if isinstance(reasons, list) else [reasons]
+        if any(m not in _SUPPRESSED_REASONS for m in members):
+            errors.append(
+                f"Value at '{prefix}suppressedReasons' failed to satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value set: [BOUNCE, COMPLAINT]]"
+            )
+    if scope_present and scope not in _SUPPRESSION_SCOPES:
+        errors.append(
+            f"Value at '{prefix}suppressionScope' failed to satisfy constraint: Member must satisfy enum value set: [TENANT, ACCOUNT]"
+        )
+    return errors
+
+
+def _combined_validation_error(errors):
+    noun = "error" if len(errors) == 1 else "errors"
+    return _json_err("BadRequestException", f"{len(errors)} validation {noun} detected: {'; '.join(errors)}")
+
+
+def _create_suppression_pairing(attrs):
+    """Pairing/null rules for CreateTenant SuppressionAttributes; returns (value, error)."""
+    reasons_present = "SuppressedReasons" in attrs
+    scope_present = "SuppressionScope" in attrs
+    reasons = attrs.get("SuppressedReasons")
+    scope = attrs.get("SuppressionScope")
+    if bool(reasons) and not scope_present:
+        return None, _json_err("BadRequestException", "SuppressedReasons cannot be specified without SuppressionScope.")
+    if scope_present and not reasons_present:
+        return None, _json_err("BadRequestException", "SuppressionScope cannot be specified without SuppressedReasons.")
+    if not bool(reasons) and not scope_present:
+        nulls = []
+        if not reasons_present:
+            nulls.append("Value null at 'suppressionAttributes.suppressedReasons' failed to satisfy constraint: Member must not be null")
+        if not scope_present:
+            nulls.append("Value null at 'suppressionAttributes.suppressionScope' failed to satisfy constraint: Member must not be null")
+        return None, _combined_validation_error(nulls)
+    return {"SuppressedReasons": list(reasons) if isinstance(reasons, list) else reasons, "SuppressionScope": scope}, None
+
+
+def _put_suppression_pairing(data):
+    """Pairing rules for PutTenantSuppressionAttributes; returns (value, clear, error)."""
+    reasons_present = "SuppressedReasons" in data
+    scope_present = "SuppressionScope" in data
+    if not reasons_present and not scope_present:
+        return None, True, None
+    reasons = data.get("SuppressedReasons")
+    scope = data.get("SuppressionScope")
+    if bool(reasons) and not scope_present:
+        return None, False, _json_err("BadRequestException", "SuppressedReasons cannot be specified without SuppressionScope.")
+    if reasons_present and not scope_present:
+        return None, False, _json_err("BadRequestException", "SuppressionScope is required when SuppressedReasons are provided. Valid values are: TENANT, ACCOUNT")
+    if scope_present and not reasons_present:
+        return None, False, _json_err("BadRequestException", "SuppressionScope cannot be specified without SuppressedReasons.")
+    return {"SuppressedReasons": list(reasons) if isinstance(reasons, list) else reasons, "SuppressionScope": scope}, False, None
+
+
+def _tenant_delete_block(arn):
+    if any(arn in resources for resources in _tenant_resources.values()):
+        return _json_err(
+            "BadRequestException",
+            f"Cannot delete <{arn}> because it has tenant associations. Remove all tenant associations and try again.",
+        )
+    return None
 
 
 def _tenant_request(method, sub, data):
@@ -365,22 +444,57 @@ def _tenant_request(method, sub, data):
             for name, resources in _tenant_resources.items()
             if arn in resources
         ]
-        page, token, err = _paginate(items, _body_paging(data), 100, maximum=1000)
+        page, token, err = _paginate(items, _body_paging(data), 100)
         return err or json_response({"ResourceTenants": page, **({"NextToken": token} if token else {})})
+    if method == "POST" and sub == "/tenant/suppression":
+        enum_errors = _suppression_enum_errors(
+            "",
+            data.get("SuppressedReasons"), "SuppressedReasons" in data,
+            data.get("SuppressionScope"), "SuppressionScope" in data,
+        )
+        if enum_errors:
+            return _combined_validation_error(enum_errors)
+        value, clear, err = _put_suppression_pairing(data)
+        if err:
+            return err
+        rec = _tenants.get(data.get("TenantName", ""))
+        if rec is None:
+            return _missing_tenant(data.get("TenantName", ""))
+        if clear:
+            rec.pop("SuppressionAttributes", None)
+        else:
+            rec["SuppressionAttributes"] = value
+        return json_response({})
     if method != "POST" or not sub.startswith("/tenants"):
         return None
     name = data.get("TenantName", "")
     if sub == "/tenants":
+        attrs = data.get("SuppressionAttributes")
+        if attrs is not None:
+            if not isinstance(attrs, dict):
+                attrs = {}
+            enum_errors = _suppression_enum_errors(
+                "suppressionAttributes.",
+                attrs.get("SuppressedReasons"), "SuppressedReasons" in attrs,
+                attrs.get("SuppressionScope"), "SuppressionScope" in attrs,
+            )
+            if enum_errors:
+                return _combined_validation_error(enum_errors)
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             return _json_err(
                 "BadRequestException",
                 f"Invalid tenant name <{name}>: only alphanumeric ASCII characters, '_', and '-' are allowed.",
             )
+        suppression = None
+        if attrs is not None:
+            suppression, err = _create_suppression_pairing(attrs)
+            if err:
+                return err
         if name in _tenants:
             return _json_err(
                 "AlreadyExistsException", f"Tenant with name {name} already exists in account {get_account_id()}"
             )
-        tenant_id = "tn-" + new_uuid().replace("-", "")[:28]
+        tenant_id = "tn-" + new_uuid().replace("-", "")[:29]
         arn = _resource_arn("tenant", f"{name}/{tenant_id}")
         rec = {
             "TenantName": name,
@@ -390,6 +504,8 @@ def _tenant_request(method, sub, data):
             "Tags": copy.deepcopy(data.get("Tags", [])),
             "SendingStatus": "ENABLED",
         }
+        if suppression is not None:
+            rec["SuppressionAttributes"] = suppression
         _tenants[name] = rec
         _tenant_resources[name] = {}
         _ses_tags[arn] = copy.deepcopy(rec["Tags"])
@@ -404,13 +520,16 @@ def _tenant_request(method, sub, data):
         status = filters.get("SENDING_STATUS")
         if status is not None and status not in ("ENABLED", "REINSTATED", "DISABLED"):
             return _json_err("BadRequestException", f"Invalid sending status <{status}>.")
-        items = [
-            {k: v for k, v in rec.items() if k != "Tags"}
-            for rec in _tenants.values()
-            if filters.get("TENANT_NAME_CONTAINS", "") in rec["TenantName"]
-            and (not filters.get("SENDING_STATUS") or filters["SENDING_STATUS"] == rec["SendingStatus"])
-        ]
-        page, token, err = _paginate(items, _body_paging(data), 100, maximum=1000)
+        items = sorted(
+            (
+                {k: v for k, v in rec.items() if k not in ("Tags", "SuppressionAttributes")}
+                for rec in _tenants.values()
+                if filters.get("TENANT_NAME_CONTAINS", "") in rec["TenantName"]
+                and (not filters.get("SENDING_STATUS") or filters["SENDING_STATUS"] == rec["SendingStatus"])
+            ),
+            key=lambda item: item["TenantName"],
+        )
+        page, token, err = _paginate(items, _body_paging(data), 100)
         return err or json_response({"Tenants": page, **({"NextToken": token} if token else {})})
     if sub not in (
         "/tenants/get",
@@ -444,12 +563,15 @@ def _tenant_request(method, sub, data):
         resource_type = filters.get("RESOURCE_TYPE")
         if resource_type is not None and resource_type not in ("configuration-set", "identity", "template"):
             return _json_err("BadRequestException", f"Invalid resource type {resource_type} specified.")
-        items = [
-            item
-            for item in items
-            if not filters.get("RESOURCE_TYPE") or item["ResourceType"] == filters["RESOURCE_TYPE"]
-        ]
-        page, token, err = _paginate(items, _body_paging(data), 100, maximum=1000)
+        items = sorted(
+            (
+                item
+                for item in items
+                if not filters.get("RESOURCE_TYPE") or item["ResourceType"] == filters["RESOURCE_TYPE"]
+            ),
+            key=lambda item: item["ResourceArn"],
+        )
+        page, token, err = _paginate(items, _body_paging(data), 100)
         return err or json_response({"TenantResources": page, **({"NextToken": token} if token else {})})
     arn = data.get("ResourceArn", "")
     _, err = _association_resource(arn)
@@ -727,6 +849,9 @@ async def handle_request(method, path, headers, body, query_params):
                 return _json_err("NotFoundException", f"Identity {identity} not found", 404)
             return json_response(rec)
         if method == "DELETE":
+            blocked = _tenant_delete_block(_resource_arn("identity", identity))
+            if blocked:
+                return blocked
             _identities.pop(identity, None)
             return json_response({})
 
@@ -766,11 +891,9 @@ async def handle_request(method, path, headers, body, query_params):
             return json_response(rec)
         if method == "DELETE":
             arn = _resource_arn("configuration-set", name)
-            if any(arn in resources for resources in _tenant_resources.values()):
-                return _json_err(
-                    "BadRequestException",
-                    f"Cannot delete <{arn}> because it has tenant associations. Remove all tenant associations and try again.",
-                )
+            blocked = _tenant_delete_block(arn)
+            if blocked:
+                return blocked
             _config_sets.pop(name, None)
             _ses_tags.pop(arn, None)
             return json_response({})
@@ -833,6 +956,9 @@ async def handle_request(method, path, headers, body, query_params):
             stored.update(_template_parts(template_content))
             return json_response({})
         if method == "DELETE":
+            blocked = _tenant_delete_block(_resource_arn("template", name))
+            if blocked:
+                return blocked
             _templates.pop(name, None)
             return json_response({})
 
