@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CloudWatch Logs — IAM tag conditions** — under `AUTH=true`, authorization now includes existing resource tags, incoming request tags, and the tag keys being added or removed. Ownership-based allows work and explicit denies can prevent removal of protected tags before state changes. ARN-based tagging APIs authorize the supplied resource ARN instead of `*` and share a validated, account- and region-scoped target lookup with the handlers. Foreign or malformed tagging ARNs, including log group ARNs ending in `:*`, fail with HTTP 400 `ValidationException` before policy evaluation, as observed on AWS. Authorization denials match live AWS's HTTP 400 JSON 1.1 envelope with a capitalized `Message` naming the resource. Contributed by @AdrianAcala.
+
 - **IoT — `https://<endpointAddress>` verifies under `USE_SSL=1`** — `DescribeEndpoint` hands out `<prefix>-ats.iot.<region>.<MINISTACK_HOST>` and `<prefix>.credentials.iot.<region>.<MINISTACK_HOST>`, which SDKs dial over HTTPS as on AWS, but the generated gateway certificate did not name them, so the handshake failed hostname verification. The certificate now carries `*.iot.<region>.<MINISTACK_HOST>` and `*.credentials.iot.<region>.<MINISTACK_HOST>` for every region, and a cached certificate without them is regenerated. Contributed by @iot-rocket.
 ### Added
 

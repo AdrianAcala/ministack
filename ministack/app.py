@@ -2496,6 +2496,7 @@ async def _dispatch_service_request(
             eventbridge_resource_arns,
             extract_iam_action,
             extract_resource_arn,
+            logs_service_context,
         )
         from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
         from ministack.core.responses import get_account_id
@@ -2510,10 +2511,28 @@ async def _dispatch_service_request(
             service_context = (
                 dynamodb_service_context(body) if service == "dynamodb" else None
             )
+            if service == "logs":
+                from ministack.services import cloudwatch_logs
+
+                logs_validation_error = None
+                if iam_action in {"logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource"}:
+                    try:
+                        logs_payload = json.loads(body or b"{}")
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        logs_payload = None
+                    if isinstance(logs_payload, dict):
+                        logs_validation_error = cloudwatch_logs.validate_tag_resource_arn(
+                            logs_payload.get("resourceArn", ""), account_id=get_account_id(), region=region,
+                        )
+                service_context = logs_service_context(
+                    iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
+                )
             denied = enforce(
                 access_key, iam_action, service, region,
                 resource_arn=resource_arn, service_context=service_context,
             )
+            if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
+                return logs_validation_error
             # A copy also reads its source, a batch delete is one check per
             # key, an attributes call is a pair, a governance bypass its own action.
             if service == "s3" and not denied:
