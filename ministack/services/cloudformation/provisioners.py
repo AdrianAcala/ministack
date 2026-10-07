@@ -755,10 +755,7 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "TopicName",
         "exists": "Topic creation failed because the topic already exists",
     },
-    # Measured on an account: a SignatureValidityPeriod change under a kept
-    # ProfileName, and an Action change under a kept StatementId and
-    # ProfileName (the permission's identity), both fail with the refusal
-    # sentence naming the physical id.
+    # A permission's identity is StatementId + ProfileName.
     "AWS::Signer::SigningProfile": {"name": "ProfileName"},
     "AWS::Signer::ProfilePermission": {"name": ("StatementId", "ProfileName")},
     # "If you specify a name, you cannot perform updates that require
@@ -861,8 +858,7 @@ def _custom_named_replacement_error(resource_type, old_props, new_props,
 
 
 def _kept_custom_name(resource_type, old_props, new_props):
-    """The explicit name an update keeps unchanged, else None. A ``name``
-    tuple is a name made of several properties, kept only when all are."""
+    """The explicit name (or tuple of names) an update keeps unchanged, else None."""
     spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
     if not spec:
         return None
@@ -10504,22 +10500,17 @@ def _ses_configuration_set_event_destination_delete(physical_id, props):
 # Signer SigningProfile and ProfilePermission
 # ---------------------------------------------------------------------------
 
-# The PlatformId enum of the resource schema (describe-type, 2026-10-05).
-# There is no SigningMaterial property, so no template reaches the IoT
-# platform, whose profiles need a certificate.
+# PlatformId's allowed values in the CloudFormation template reference.
 _SIGNER_CFN_PLATFORMS = ("AWSLambda-SHA384-ECDSA", "Notation-OCI-SHA384-ECDSA")
 
-# Property enums of the resource schemas. AWS checks them before it
-# provisions anything (pre-deployment PROPERTY_VALIDATION): the stack fails
-# with no resource created, also when the value comes from a parameter.
+# Property enums checked before a stack create provisions anything.
 _PROPERTY_ENUMS = {
     "AWS::Signer::SigningProfile": {"PlatformId": _SIGNER_CFN_PLATFORMS},
 }
 
 
 def _property_enum_errors(resource_type, props):
-    """``(property, reason)`` for each value outside its schema enum, with
-    AWS's ValidationStatusReason."""
+    """(property, reason) for each value outside its schema enum."""
     return [
         (prop, f"{props[prop]} is not a valid enum value. Supported values: "
                f"[{', '.join(allowed)}]")
@@ -10551,14 +10542,7 @@ def _signer_profile_name_from_arn(physical_id):
 
 
 def _signer_signing_profile_create(logical_id, props, stack_name):
-    """Ref is the profile ARN. Without a ProfileName the name is
-    ``<LogicalId>_<12 random letters and digits>`` (measured: Prof_s3JMHz2XvtHK).
-    The suffix is random, not hashed from the stack: a canceled profile keeps
-    its name for good, so recreating a deleted stack must not reuse one. The
-    tags, stack tags and ``aws:cloudformation:`` tags included, are stored as
-    given: the ``aws:`` prefix PutSigningProfile refuses is CloudFormation's own.
-    The profile is created through PutSigningProfile's own path, so jobs treat
-    it like any other profile."""
+    """Ref is the profile ARN; a generated name is <LogicalId>_ + 12 random letters and digits."""
     import ministack.services.signer as _signer
     # The stack checks the enum before provisioning; a value that came from
     # another resource is only known here.
@@ -10585,9 +10569,7 @@ def _signer_signing_profile_create(logical_id, props, stack_name):
 
 
 def _signer_signing_profile_update(physical_id, old_props, new_props, stack_name):
-    """Only Tags can reach this: the other properties are create-only and
-    replace the profile first. Tags change in place and the profile keeps
-    its version, as measured."""
+    """Only Tags update in place; the profile keeps its version."""
     import ministack.services.signer as _signer
     profile = _signer._profiles.get(_signer_profile_name_from_arn(physical_id))
     if profile is None:
@@ -10599,8 +10581,7 @@ def _signer_signing_profile_update(physical_id, old_props, new_props, stack_name
 
 
 def _signer_signing_profile_delete(physical_id, props):
-    """A signing profile cannot be deleted: CloudFormation cancels it, and
-    the canceled profile keeps its name."""
+    """A profile cannot be deleted: CloudFormation cancels it."""
     import ministack.services.signer as _signer
     _signer._cancel_signing_profile(_signer_profile_name_from_arn(physical_id))
 
@@ -10612,9 +10593,7 @@ def _signer_current_revision(profile_name):
 
 
 def _signer_profile_permission_create(logical_id, props, stack_name):
-    """Ref is ``<StatementId>|<ProfileName>``, as measured. The handler reads
-    the policy's current revision first, so permissions on one profile do
-    not conflict with each other."""
+    """Ref is <StatementId>|<ProfileName>; adds at the policy's current revision."""
     import ministack.services.signer as _signer
     name = props.get("ProfileName", "")
     sid = props.get("StatementId", "")

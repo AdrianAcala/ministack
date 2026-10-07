@@ -1081,7 +1081,7 @@ def _list_domain_configurations(qp: dict) -> tuple:
     try:
         page_size = int(raw_size) if raw_size not in (None, "") else None
     except (TypeError, ValueError):
-        return _domain_config_invalid("pageSize must be an integer")
+        return _domain_config_invalid("The request is not valid.")
     if page_size is not None and page_size > _DOMAIN_CONFIG_LIST_LIMIT:
         return _domain_config_constraint(
             "pageSize", f"have value less than or equal to {_DOMAIN_CONFIG_LIST_LIMIT}")
@@ -1184,11 +1184,7 @@ def _update_domain_configuration(name: str, payload: dict) -> tuple:
 
 
 def _delete_domain_configuration(name: str) -> tuple:
-    """``DELETE /domainConfigurations/{name}``: only a DISABLED configuration
-    goes, and an unknown name answers 200, as on AWS. AWS also keeps an
-    AWS_MANAGED configuration until it has been DISABLED for seven days; that
-    wall-clock hold is not enforced, so a test or stack can clean up after
-    itself."""
+    """Only a DISABLED configuration goes (an AWS-managed one after seven days); an unknown name is 200."""
     err = _domain_config_name_error(name, _DOMAIN_CONFIG_NAME_RE)
     if err:
         return err
@@ -1198,6 +1194,11 @@ def _delete_domain_configuration(name: str) -> tuple:
     if record["domainConfigurationStatus"] != "DISABLED":
         return _domain_config_invalid(
             "Cannot delete a domain configuration that is not disabled")
+    if (record.get("domainType") == "AWS_MANAGED"
+            and _now_epoch() - float(record.get("lastStatusChangeDate") or 0) < 7 * 86400):
+        return _domain_config_invalid(
+            "AWS Managed Domain Configuration must be disabled for at least 7 days "
+            "before it can be deleted")
     del _domain_configurations[name]
     return json_response({})
 

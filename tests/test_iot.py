@@ -363,8 +363,8 @@ def test_iot_domain_configuration_update_iot_owned(iot_client):
 
 
 def test_iot_domain_configuration_delete(iot_client):
-    """Only a DISABLED configuration is deleted. AWS also holds an AWS-managed
-    one for seven days after it was disabled; MiniStack deletes it at once."""
+    """Only a DISABLED configuration is deleted, and an AWS-managed one only
+    seven days after it was disabled."""
     name = _unique("dc-del")
     iot_client.create_domain_configuration(domainConfigurationName=name)
     delete = iot_client.delete_domain_configuration
@@ -372,11 +372,12 @@ def test_iot_domain_configuration_delete(iot_client):
         "InvalidRequestException", "Cannot delete a domain configuration that is not disabled")
     iot_client.update_domain_configuration(
         domainConfigurationName=name, domainConfigurationStatus="DISABLED")
-    delete(domainConfigurationName=name)
-    assert _dc_error(iot_client.describe_domain_configuration,
-                     domainConfigurationName=name)[0] == "ResourceNotFoundException"
-    assert name not in [d["domainConfigurationName"]
-                        for d in iot_client.list_domain_configurations()["domainConfigurations"]]
+    assert _dc_error(delete, domainConfigurationName=name) == (
+        "InvalidRequestException",
+        "AWS Managed Domain Configuration must be disabled for at least 7 days "
+        "before it can be deleted")
+    assert iot_client.describe_domain_configuration(
+        domainConfigurationName=name)["domainConfigurationStatus"] == "DISABLED"
     # An unknown name is a no-op; the IoT-owned names fail the Delete pattern.
     delete(domainConfigurationName=_unique("dc-never"))
     assert _dc_error(delete, domainConfigurationName="iot:Data-ATS")[1].endswith(

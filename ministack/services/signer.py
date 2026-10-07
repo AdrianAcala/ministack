@@ -733,8 +733,7 @@ def _put_signing_profile(name, body):
         if problem is not None:
             return problem
     if name in _profiles:
-        # A profile name is taken for good: AWS refuses a second put on an
-        # Active profile and on a Canceled one alike (measured 2026-10-05).
+        # A profile name is taken for good, Active or Canceled.
         return _coded_error(400, "ValidationException", "ProfileAlreadyExists",
                             f"Profile with name {name} already exists")
     profile = _register_profile(name, body)
@@ -759,10 +758,7 @@ def _get_signing_profile(name):
     return json_response(shown)
 
 
-# Profile permissions. The statements live on the profile record under
-# "policy" ({"revisionId", "statements"}), so persistence, reset and the
-# account/region scoping follow the profile. Wording, codes and ordering below
-# were measured on AWS 2026-10-05 (eu-central-1, AWSLambda-SHA384-ECDSA).
+# Profile permissions live on the profile record under "policy".
 
 _PERMISSION_ACTIONS = ("signer:StartSigningJob", "signer:GetSigningProfile",
                        "signer:RevokeSignature")
@@ -772,8 +768,7 @@ _MAX_POLICY_BYTES = 2000
 
 
 def _coded_error(status, error_type, code, message):
-    """A signer error whose body carries the `code` member AWS fills in for
-    these operations (for example `PolicyRevisionIdMismatch`)."""
+    """A signer error carrying the `code` member."""
     return error_response_json(error_type, message, status, extra={"code": code},
                                content_type=REST_JSON_CONTENT_TYPE)
 
@@ -792,17 +787,13 @@ def _policy_statement(profile, permission, expand_principal):
 
 
 def _policy_size(profile, permissions, expand_principal=True):
-    """The length of the compact JSON statement list. With the account id
-    principals written as `arn:aws:iam::<id>:root` this is policySizeBytes;
-    with the principals as given it is what the 2000-byte limit counts (2000
-    was accepted and 2001 refused). Both reproduced every size measured on
-    AWS, for account and role principals, with and without profileVersion."""
+    """Compact JSON length of the statements (policySizeBytes, or the 2000-byte limit with principals as given)."""
     statements = [_policy_statement(profile, p, expand_principal) for p in permissions]
     return len(json.dumps(statements, separators=(",", ":")))
 
 
 def _active_profile_for_permissions(name, verb):
-    """`(profile, None)` for an Active profile, else `(None, error)`."""
+    """(profile, None) for an Active profile, else (None, error)."""
     name_err = _validate_profile_name(name)
     if name_err:
         return None, name_err
@@ -893,10 +884,7 @@ def _no_policy(name):
 
 
 def _list_profile_permissions(name):
-    """The whole policy in one page. AWS caps a policy at 2000 bytes, which
-    is a handful of statements, and answered every listing measured in one
-    page, ignoring a nextToken it did not issue; nextToken is ignored here
-    and never returned."""
+    """The whole policy in one page; nextToken is ignored and never returned."""
     profile, err = _active_profile_for_permissions(name, None)
     if err:
         return err
@@ -935,10 +923,7 @@ def _remove_profile_permission(name, sid, revision):
 
 
 def _cancel_signing_profile(name):
-    """Status becomes Canceled; the name stays taken and the permissions stay
-    listable, but they can no longer be added or removed. Canceling twice
-    succeeds. On the first cancel AWS issued a new revisionId for the
-    policy, which is mirrored here."""
+    """Cancel a profile; its name stays taken and its permissions stay listable."""
     name_err = _validate_profile_name(name)
     if name_err:
         return name_err

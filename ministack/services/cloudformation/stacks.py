@@ -600,12 +600,7 @@ _VALIDATION_ROLLBACK = "Validation failure detected. See the operation's FAILED 
 
 def _fail_property_validation(stack, stack_id, stack_name, resources_defs, ordered,
                               param_values, conditions, mappings, disable_rollback):
-    """Fail a create whose template sets a property outside its schema enum,
-    before anything is provisioned, with the events AWS records (measured
-    2026-10-05: one count for all errors, a parameter's value is checked,
-    the valid resources are not created either). A value that depends on
-    another resource is left to the provisioner. AWS lists the errors
-    through DescribeEvents, which is not served; they are logged."""
+    """Fail a create with a property outside its schema enum before provisioning anything."""
     errors = []
     for logical_id in ordered:
         res_def = resources_defs[logical_id]
