@@ -545,6 +545,7 @@ subnet = ec2.create_subnet(
 | `AWS::IoT::ThingPrincipalAttachment` | `{ThingName}\|{Principal}` | None |
 | `AWS::IoT::PolicyPrincipalAttachment` | `{PolicyName}\|{Principal}` | None |
 | `AWS::IoT::CACertificate` | Certificate id | Arn, Id |
+| `AWS::IoT::DomainConfiguration` | Domain configuration name | Arn, DomainType, ServerCertificates |
 | `AWS::IoT::ThingGroup` | Thing group id | Arn, Id |
 | `AWS::ECR::Repository` | Repo name | Arn, RepositoryUri |
 | `AWS::IAM::ManagedPolicy` | Policy ARN | — |
