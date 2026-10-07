@@ -4607,7 +4607,8 @@ def _replication_rule_for(bucket_name: str, key: str) -> tuple[dict | None, str]
             continue
         prefix = rule.get("Prefix")
         if prefix is None:
-            prefix = (rule.get("Filter") or {}).get("Prefix", "")
+            rule_filter = rule.get("Filter") or {}
+            prefix = rule_filter.get("Prefix") or (rule_filter.get("And") or {}).get("Prefix") or ""
         if key.startswith(prefix):
             return rule, config.get("Role", "")
     return None, ""
@@ -4632,14 +4633,22 @@ def _in_account(account_id: str):
         set_request_account_id(previous)
 
 
+def _bucket_owner_enforced(bucket: dict) -> bool:
+    stored = bucket.get("_ownership_controls")
+    if stored:
+        return "BucketOwnerEnforced" in stored
+    return not bucket.get("_ownership_controls_deleted")
+
+
 def _replication_destination_allows(dest_account: str, dest_name: str, key: str,
-                                    role: str, dest: dict) -> bool:
+                                    role: str, dest: dict, dest_bucket: dict) -> bool:
     """Whether the destination bucket policy grants the replication role.
 
     Cross-account replication requires the destination owner to allow the
     source's replication role ``s3:ReplicateObject`` on the destination
     objects, plus ``s3:ObjectOwnerOverrideToBucketOwner`` when the rule
-    carries ``AccessControlTranslation``. A missing or denying policy stamps
+    carries ``AccessControlTranslation`` and the destination is not
+    ``BucketOwnerEnforced``. A missing or denying policy stamps
     the source FAILED, as AWS reports a replica it could not write.
     """
     policy = _bucket_policies.get_scoped(dest_account, None, dest_name)
@@ -4660,7 +4669,7 @@ def _replication_destination_allows(dest_account: str, dest_name: str, key: str,
     )
     if evaluate_resource_policy(policy, ctx).decision != "Allow":
         return False
-    if dest.get("AccessControlTranslation"):
+    if dest.get("AccessControlTranslation") and not _bucket_owner_enforced(dest_bucket):
         ctx = EvalContext(
             principal_arn=role,
             principal_type="AssumedRole",
@@ -4695,16 +4704,15 @@ def _maybe_replicate(bucket_name: str, key: str, obj: dict, data) -> None:
     dest_ref = dest.get("Bucket") or ""
     dest_name = dest_ref.split(":::")[-1] if ":::" in dest_ref else dest_ref
     source_account = get_account_id()
-    # AWS resolves the destination inside the account the rule names; a rule
-    # without Destination.Account targets a destination the source owns.
-    dest_account = dest.get("Account") or source_account
-    dest_bucket = _buckets.get_scoped(dest_account, None, dest_name)
+    # The name identifies the bucket; Destination.Account only names the owner for AccessControlTranslation.
+    dest_account = _bucket_owner_account(dest_name)
+    dest_bucket = _buckets.get_scoped(dest_account, None, dest_name) if dest_account else None
     if (dest_bucket is None or dest_name == bucket_name
             or _bucket_versioning.get_scoped(dest_account, None, dest_name) != "Enabled"):
         obj["replication_status"] = "FAILED"
         return
     if (dest_account != source_account and not _replication_destination_allows(
-            dest_account, dest_name, key, role, dest)):
+            dest_account, dest_name, key, role, dest, dest_bucket)):
         obj["replication_status"] = "FAILED"
         return
 
@@ -6307,6 +6315,52 @@ def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, quer
 # ---------------------------------------------------------------------------
 
 
+def _replication_tag(tag_el) -> dict:
+    key_el, value_el = _find_xml_tag(tag_el, "Key"), _find_xml_tag(tag_el, "Value")
+    return {"Key": key_el.text if key_el is not None and key_el.text else "",
+            "Value": value_el.text if value_el is not None and value_el.text else ""}
+
+
+def _parse_replication_filter(filter_el) -> dict:
+    """A ReplicationRuleFilter: Prefix, Tag, or And (Prefix and Tags)."""
+    out: dict = {}
+    prefix_el = _find_xml_tag(filter_el, "Prefix")
+    if prefix_el is not None:
+        out["Prefix"] = prefix_el.text or ""
+    tag_el = _find_xml_tag(filter_el, "Tag")
+    if tag_el is not None:
+        out["Tag"] = _replication_tag(tag_el)
+    and_el = _find_xml_tag(filter_el, "And")
+    if and_el is not None:
+        and_op: dict = {}
+        and_prefix = _find_xml_tag(and_el, "Prefix")
+        if and_prefix is not None:
+            and_op["Prefix"] = and_prefix.text or ""
+        tags = [_replication_tag(t) for t in and_el if t.tag.split("}")[-1] == "Tag"]
+        if tags:
+            and_op["Tags"] = tags
+        out["And"] = and_op
+    return out
+
+
+def _replication_filter_xml(filter_el, rule_filter: dict) -> None:
+    def _tag(parent, tag):
+        tag_el = SubElement(parent, "Tag")
+        SubElement(tag_el, "Key").text = tag.get("Key", "")
+        SubElement(tag_el, "Value").text = tag.get("Value", "")
+
+    if "Prefix" in rule_filter:
+        SubElement(filter_el, "Prefix").text = rule_filter["Prefix"]
+    if "Tag" in rule_filter:
+        _tag(filter_el, rule_filter["Tag"])
+    if "And" in rule_filter:
+        and_el = SubElement(filter_el, "And")
+        if "Prefix" in rule_filter["And"]:
+            SubElement(and_el, "Prefix").text = rule_filter["And"]["Prefix"]
+        for tag in rule_filter["And"].get("Tags", []):
+            _tag(and_el, tag)
+
+
 def _put_bucket_replication(bucket_name: str, body: bytes):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
@@ -6341,10 +6395,7 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
             rule["Prefix"] = prefix_el.text
         filter_el = _find_xml_tag(rule_el, "Filter")
         if filter_el is not None:
-            fprefix = _find_xml_tag(filter_el, "Prefix")
-            rule["Filter"] = {
-                "Prefix": fprefix.text if fprefix is not None and fprefix.text is not None else ""
-            }
+            rule["Filter"] = _parse_replication_filter(filter_el)
         priority_el = _find_xml_tag(rule_el, "Priority")
         if priority_el is not None and priority_el.text and priority_el.text.isdigit():
             rule["Priority"] = int(priority_el.text)
@@ -6418,8 +6469,7 @@ def _get_bucket_replication(bucket_name: str):
         if "Prefix" in rule:
             SubElement(rule_el, "Prefix").text = rule["Prefix"]
         if "Filter" in rule:
-            filter_el = SubElement(rule_el, "Filter")
-            SubElement(filter_el, "Prefix").text = (rule["Filter"] or {}).get("Prefix", "")
+            _replication_filter_xml(SubElement(rule_el, "Filter"), rule["Filter"] or {})
         if "DeleteMarkerReplication" in rule:
             dmr_el = SubElement(rule_el, "DeleteMarkerReplication")
             SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(

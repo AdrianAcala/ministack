@@ -7575,16 +7575,20 @@ def _dest_policy(dest_bucket, actions=("s3:ReplicateObject", "s3:ObjectOwnerOver
     })
 
 
-def _cross_account_pair(slug, policy="default", dest_account=_DEST_ACCOUNT):
+def _cross_account_pair(slug, policy="default", translate=True, ownership=None):
     """Source bucket in _SOURCE_ACCOUNT, destination bucket in _DEST_ACCOUNT,
-    one Enabled rule naming Destination.Account. ``policy`` selects the
-    destination bucket policy: ``"default"`` grants the replication role,
-    ``None`` leaves the bucket without a policy, anything else is applied
-    verbatim."""
+    one Enabled rule (with Account and AccessControlTranslation unless
+    ``translate`` is False). ``policy`` selects the destination bucket policy:
+    ``"default"`` grants the replication role, ``None`` leaves the bucket
+    without a policy, anything else is applied verbatim. ``ownership`` sets
+    the destination's Object Ownership."""
     src_client, dst_client = _s3_account(_SOURCE_ACCOUNT), _s3_account(_DEST_ACCOUNT)
     src, dst = f"qa-xrepl-src-{slug}", f"qa-xrepl-dst-{slug}"
     dst_client.create_bucket(Bucket=dst)
     dst_client.put_bucket_versioning(Bucket=dst, VersioningConfiguration={"Status": "Enabled"})
+    if ownership:
+        dst_client.put_bucket_ownership_controls(
+            Bucket=dst, OwnershipControls={"Rules": [{"ObjectOwnership": ownership}]})
     if policy == "default":
         dst_client.put_bucket_policy(Bucket=dst, Policy=_dest_policy(dst))
     elif policy is not None:
@@ -7598,11 +7602,10 @@ def _cross_account_pair(slug, policy="default", dest_account=_DEST_ACCOUNT):
             "Rules": [{
                 "ID": "r1", "Status": "Enabled", "Filter": {"Prefix": ""},
                 "DeleteMarkerReplication": {"Status": "Disabled"},
-                "Destination": {
-                    "Bucket": f"arn:aws:s3:::{dst}",
-                    "Account": dest_account,
+                "Destination": {"Bucket": f"arn:aws:s3:::{dst}"} | ({
+                    "Account": _DEST_ACCOUNT,
                     "AccessControlTranslation": {"Owner": "Destination"},
-                },
+                } if translate else {}),
             }],
         },
     )
@@ -7652,9 +7655,9 @@ def test_s3_replication_cross_account_requires_destination_policy(s3):
 
 def test_s3_replication_cross_account_requires_owner_override_grant(s3):
     """AccessControlTranslation needs s3:ObjectOwnerOverrideToBucketOwner in
-    the destination policy; without it replication fails."""
+    the destination policy unless the destination is BucketOwnerEnforced."""
     partial = _dest_policy("qa-xrepl-dst-own", actions=("s3:ReplicateObject",))
-    src_client, dst_client, src, dst = _cross_account_pair("own", policy=partial)
+    src_client, dst_client, src, dst = _cross_account_pair("own", policy=partial, ownership="ObjectWriter")
     try:
         src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"x")
         assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "FAILED"
@@ -7663,17 +7666,42 @@ def test_s3_replication_cross_account_requires_owner_override_grant(s3):
         _purge_foreign(dst_client, dst)
 
 
-def test_s3_replication_cross_account_unknown_destination_account(s3):
-    """A Destination.Account that owns no such bucket resolves to nothing —
-    the replica cannot be written and the source reports FAILED."""
-    src_client, dst_client, src, dst = _cross_account_pair(
-        "ghost", dest_account="555555555555")
+def test_s3_replication_cross_account_bucket_owner_enforced_needs_no_override_grant(s3):
+    """BucketOwnerEnforced, the default, owns replicas without s3:ObjectOwnerOverrideToBucketOwner."""
+    partial = _dest_policy("qa-xrepl-dst-enf", actions=("s3:ReplicateObject",))
+    src_client, dst_client, src, dst = _cross_account_pair("enf", policy=partial)
     try:
         src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"x")
-        assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "FAILED"
+        assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "COMPLETED"
     finally:
         _purge_foreign(src_client, src)
         _purge_foreign(dst_client, dst)
+
+
+def test_s3_replication_cross_account_without_destination_account(s3):
+    """The bucket name identifies the destination; Account is only for owner override."""
+    src_client, dst_client, src, dst = _cross_account_pair("noacct", translate=False)
+    try:
+        src_client.put_object(Bucket=src, Key="telemetry/k", Body=b"x")
+        assert src_client.head_object(Bucket=src, Key="telemetry/k")["ReplicationStatus"] == "COMPLETED"
+        assert dst_client.head_object(Bucket=dst, Key="telemetry/k")["ReplicationStatus"] == "REPLICA"
+    finally:
+        _purge_foreign(src_client, src)
+        _purge_foreign(dst_client, dst)
+
+
+def test_s3_replication_filter_round_trips_tag_and_and(s3):
+    src, dst = _bucket(s3, versioned=True), _bucket(s3, versioned=True)
+    rules = [
+        {"ID": "tag", "Priority": 1, "Status": "Enabled", "DeleteMarkerReplication": {"Status": "Disabled"},
+         "Filter": {"Tag": {"Key": "k", "Value": "v"}}, "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}},
+        {"ID": "and", "Priority": 2, "Status": "Enabled", "DeleteMarkerReplication": {"Status": "Disabled"},
+         "Filter": {"And": {"Prefix": "logs/", "Tags": [{"Key": "a", "Value": "1"}, {"Key": "b", "Value": "2"}]}},
+         "Destination": {"Bucket": f"arn:aws:s3:::{dst}"}},
+    ]
+    s3.put_bucket_replication(Bucket=src, ReplicationConfiguration={"Role": _REPL_ROLE, "Rules": rules})
+    got = s3.get_bucket_replication(Bucket=src)["ReplicationConfiguration"]["Rules"]
+    assert [r["Filter"] for r in got] == [r["Filter"] for r in rules]
 
 
 def test_s3_replication_config_round_trips_cross_account_fields(s3):
