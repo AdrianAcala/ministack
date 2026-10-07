@@ -8,8 +8,8 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``UpdateThing``, ``DeleteThing``
   - ThingType: ``CreateThingType`` and friends
   - ThingGroup: ``CreateThingGroup`` and friends
-  - Certificates: ``CreateKeysAndCertificate``, ``RegisterCertificate``,
-    ``RegisterCertificateWithoutCA``, ``UpdateCertificate``,
+  - Certificates: ``CreateKeysAndCertificate``, ``CreateCertificateFromCsr``,
+    ``RegisterCertificate``, ``RegisterCertificateWithoutCA``, ``UpdateCertificate``,
     ``DeleteCertificate``, ``AttachThingPrincipal`` / ``DetachThingPrincipal``
   - CA certificates + JITR: ``GetRegistrationCode`` / ``DeleteRegistrationCode``,
     ``RegisterCACertificate``, ``DescribeCACertificate``, ``UpdateCACertificate``,
@@ -92,6 +92,7 @@ from ministack.core.x509_utils import (
     certificate_is_signed_by,
     generate_ca,
     get_certificate_id,
+    sign_certificate_request,
     sign_leaf_certificate,
 )
 
@@ -557,10 +558,12 @@ async def _route_request(
     # Certificates
     if path == "/keys-and-certificate" and method == "POST":
         return _create_keys_and_certificate(qp)
+    if path == "/certificates" and method == "POST":
+        return _create_certificate_from_csr(_parse_body(body), qp)
     if path == "/certificate/register" and method == "POST":
         return await _register_certificate(_parse_body(body), qp)
     if path == "/certificate/register-no-ca" and method == "POST":
-        return await _register_certificate(_parse_body(body), qp, without_ca=True)
+        return await _register_certificate_without_ca(_parse_body(body), qp)
 
     # CA certificates + JITR registration code
     if path == "/registrationcode" and method in ("GET", "DELETE"):
@@ -1562,6 +1565,42 @@ def _create_keys_and_certificate(qp: dict) -> tuple:
     })
 
 
+def _create_certificate_from_csr(payload: dict, qp: dict) -> tuple:
+    """``POST /certificates``: sign the caller's CSR with the Local CA.
+
+    The certificate keeps the CSR's subject and key and is INACTIVE unless
+    ``setAsActive``; a CSR that does not parse or verify, or whose key AWS
+    does not accept, is refused with the message AWS uses for all of these.
+    """
+    try:
+        ca_cert_pem, ca_key_pem = _ensure_ca()
+        cert_pem = sign_certificate_request(
+            ca_cert_pem, ca_key_pem, payload.get("certificateSigningRequest") or "")
+    except ValueError:
+        return error_response_json("InvalidRequestException", "CSR violates constraints", 400)
+    except RuntimeError as e:
+        return error_response_json("InternalFailureException", str(e), 503)
+    cert_id = get_certificate_id(cert_pem)
+    record = _certificate_record(
+        cert_id, cert_pem, "ACTIVE" if _qp_bool(qp, "setAsActive") else "INACTIVE")
+    _certificates[cert_id] = record
+    return json_response({
+        "certificateArn": record["certificateArn"],
+        "certificateId": cert_id,
+        "certificatePem": cert_pem,
+    })
+
+
+async def _register_certificate_without_ca(payload: dict, qp: dict) -> tuple:
+    """``RegisterCertificateWithoutCA``: a certificate registered without a
+    CA is in ``SNI_ONLY`` mode, which DescribeCertificate reports."""
+    response = await _register_certificate(payload, qp, without_ca=True)
+    if response[0] == 200:
+        cert_id = json.loads(response[2])["certificateId"]
+        _certificates[cert_id] = {**_certificates[cert_id], "certificateMode": "SNI_ONLY"}
+    return response
+
+
 def _certificate_already_exists(cert_id: str, arn: str | None = None) -> tuple:
     """409 for a duplicate PEM, carrying ``resourceId``/``resourceArn`` the way
     real AWS's ``ResourceAlreadyExistsException`` does — all register variants
@@ -1836,6 +1875,7 @@ def _handle_certificate(method: str, path: str, body: bytes, qp: dict) -> tuple:
             "certificatePem": record["certificatePem"],
             "ownedBy": record["ownedBy"],
             "creationDate": record.get("creationDate"),
+            "certificateMode": record.get("certificateMode", "DEFAULT"),
         }
         # Present only for CA-signed registrations, so JITR consumers can
         # resolve the signing CA (per the CertificateDescription model).
