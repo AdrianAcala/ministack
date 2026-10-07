@@ -45,6 +45,12 @@ from ministack.services.ses import (
     _smtp_relay,
     _templates,
 )
+from ministack.services.ses import (
+    _configuration_sets as _v1_config_sets,
+)
+from ministack.services.ses import (
+    _identities as _v1_identities,
+)
 
 logger = logging.getLogger("ses-v2")
 
@@ -288,12 +294,12 @@ def _local_ses_v2_resource_arn(arn):
         return None, _invalid_resource_arn(arn)
 
     if (
-        spec.partition != "aws"
-        or spec.service != "ses"
+        spec.service != "ses"
         or spec.account_id != get_account_id()
         or spec.region != get_region()
     ):
         return None, _invalid_resource_arn(arn)
+    canonical = f"arn:aws:{spec.service}:{spec.region}:{spec.account_id}:{spec.resource}"
 
     kind, sep, name = spec.resource.partition("/")
     if sep != "/" or not name or ("/" in name and kind != "tenant"):
@@ -317,7 +323,7 @@ def _local_ses_v2_resource_arn(arn):
             return None, _invalid_resource_arn(arn)
         tenant_name, tenant_id = parts
         rec = _tenants.get(tenant_name)
-        if not rec or rec["TenantArn"] != arn:
+        if not rec or rec["TenantArn"] != canonical:
             return None, _json_err(
                 "NotFoundException",
                 f"No Tenant present with name: {tenant_name}with tenantId: {tenant_id}",
@@ -326,7 +332,7 @@ def _local_ses_v2_resource_arn(arn):
     else:
         return None, _invalid_resource_arn(arn)
 
-    return str(spec), None
+    return canonical, None
 
 
 def _missing_tenant(name):
@@ -334,27 +340,29 @@ def _missing_tenant(name):
 
 
 def _association_resource(arn):
+    """Validate an association ARN; returns (kind, canonical aws-partition ARN, error)."""
     try:
         spec = parse_arn(arn)
     except (ArnParseError, TypeError):
-        return None, _json_err("BadRequestException", "Provided resource identifier is not an SES resource")
+        return None, None, _json_err("BadRequestException", "Provided resource identifier is not an SES resource")
     if spec.service != "ses":
-        return None, _json_err("BadRequestException", "Provided ARN is not in SES resource ARN format")
+        return None, None, _json_err("BadRequestException", "Provided ARN is not in SES resource ARN format")
     kind, _, name = spec.resource.partition("/")
     if kind not in ("configuration-set", "identity", "template"):
-        return None, _json_err("BadRequestException", f"Unsupported resource type: {kind}")
+        return None, None, _json_err("BadRequestException", f"Unsupported resource type: {kind}")
     if spec.region != get_region():
-        return None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same region")
+        return None, None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same region")
     if spec.account_id != get_account_id():
-        return None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same account")
-    store, label = {
-        "configuration-set": (_config_sets, "Configuration set"),
-        "identity": (_identities, "Identity"),
-        "template": (_templates, "Template"),
+        return None, None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same account")
+    stores, label = {
+        "configuration-set": ((_v1_config_sets, _config_sets), "Configuration set"),
+        "identity": ((_v1_identities, _identities), "Identity"),
+        "template": ((_templates,), "Template"),
     }[kind]
-    if name not in store:
-        return None, _json_err("NotFoundException", f"{label} <{name}> does not exist:", 404)
-    return kind, None
+    if not any(name in store for store in stores):
+        return None, None, _json_err("NotFoundException", f"{label} <{name}> does not exist:", 404)
+    canonical = f"arn:aws:{spec.service}:{spec.region}:{spec.account_id}:{spec.resource}"
+    return kind, canonical, None
 
 
 _SUPPRESSED_REASONS = ("BOUNCE", "COMPLAINT")
@@ -431,18 +439,18 @@ def _tenant_delete_block(arn):
 def _tenant_request(method, sub, data):
     if method == "POST" and sub == "/resources/tenants/list":
         arn = data.get("ResourceArn", "")
-        _, err = _association_resource(arn)
+        _, canonical, err = _association_resource(arn)
         if err:
             return err
         items = [
             {
                 "TenantName": name,
                 "TenantId": _tenants[name]["TenantId"],
-                "ResourceArn": arn,
-                "AssociatedTimestamp": resources[arn],
+                "ResourceArn": canonical,
+                "AssociatedTimestamp": resources[canonical],
             }
             for name, resources in _tenant_resources.items()
-            if arn in resources
+            if canonical in resources
         ]
         page, token, err = _paginate(items, _body_paging(data), 100)
         return err or json_response({"ResourceTenants": page, **({"NextToken": token} if token else {})})
@@ -574,17 +582,17 @@ def _tenant_request(method, sub, data):
         page, token, err = _paginate(items, _body_paging(data), 100)
         return err or json_response({"TenantResources": page, **({"NextToken": token} if token else {})})
     arn = data.get("ResourceArn", "")
-    _, err = _association_resource(arn)
+    _, canonical, err = _association_resource(arn)
     if err:
         return err
     if sub.endswith("/delete"):
-        resources.pop(arn, None)
+        resources.pop(canonical, None)
     else:
-        if arn in resources:
+        if canonical in resources:
             return _json_err(
                 "AlreadyExistsException", f"Resources {arn} has already been associated with tenant {name}"
             )
-        resources[arn] = time.time()
+        resources[canonical] = time.time()
     return json_response({})
 
 

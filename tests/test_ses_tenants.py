@@ -499,3 +499,77 @@ def test_tenant_list_pagesize_bounds(sesv2):
            ResourceArn=arn, PageSize=101)
     sesv2.delete_tenant(TenantName=name)
     sesv2.delete_configuration_set(ConfigurationSetName=cs)
+
+
+def test_tenant_v1_resources_can_be_associated(sesv2, ses):
+    prefix = "tenant-v1res-" + uuid.uuid4().hex[:10]
+    cs, dom = prefix + "-cs", prefix + ".example.com"
+    ses.create_configuration_set(ConfigurationSet={"Name": cs})
+    ses.verify_domain_identity(Domain=dom)
+    name = prefix + "-t"
+    sesv2.create_tenant(TenantName=name)
+    cs_arn = f"arn:aws:ses:us-east-1:000000000000:configuration-set/{cs}"
+    idn_arn = f"arn:aws:ses:us-east-1:000000000000:identity/{dom}"
+    sesv2.create_tenant_resource_association(TenantName=name, ResourceArn=cs_arn)
+    sesv2.create_tenant_resource_association(TenantName=name, ResourceArn=idn_arn)
+    assert sesv2.list_tenant_resources(TenantName=name)["TenantResources"] == [
+        {"ResourceType": "configuration-set", "ResourceArn": cs_arn},
+        {"ResourceType": "identity", "ResourceArn": idn_arn},
+    ]
+    blocked = "because it has tenant associations. Remove all tenant associations and try again."
+    _error(sesv2, "delete_configuration_set", "BadRequestException",
+           f"Cannot delete <{cs_arn}> {blocked}", ConfigurationSetName=cs)
+    _error(sesv2, "delete_email_identity", "BadRequestException",
+           f"Cannot delete <{idn_arn}> {blocked}", EmailIdentity=dom)
+    _error(ses, "delete_configuration_set", "InvalidParameterValue",
+           f"Cannot delete <{cs_arn}> {blocked}", ConfigurationSetName=cs)
+    _error(ses, "delete_identity", "InvalidParameterValue",
+           f"Cannot delete <{idn_arn}> {blocked}", Identity=dom)
+    sesv2.delete_tenant_resource_association(TenantName=name, ResourceArn=cs_arn)
+    sesv2.delete_tenant_resource_association(TenantName=name, ResourceArn=idn_arn)
+    sesv2.delete_tenant(TenantName=name)
+    ses.delete_configuration_set(ConfigurationSetName=cs)
+    ses.delete_identity(Identity=dom)
+
+
+def test_tenant_association_normalizes_foreign_partitions(sesv2):
+    prefix = "tenant-part-" + uuid.uuid4().hex[:10]
+    cs = prefix + "-cs"
+    sesv2.create_configuration_set(ConfigurationSetName=cs)
+    name = prefix + "-t"
+    tenant = sesv2.create_tenant(TenantName=name)
+    aws_arn = f"arn:aws:ses:us-east-1:000000000000:configuration-set/{cs}"
+    cn_arn = f"arn:aws-cn:ses:us-east-1:000000000000:configuration-set/{cs}"
+    sesv2.create_tenant_resource_association(TenantName=name, ResourceArn=cn_arn)
+    assert sesv2.list_tenant_resources(TenantName=name)["TenantResources"] == [
+        {"ResourceType": "configuration-set", "ResourceArn": aws_arn}
+    ]
+    _error(sesv2, "create_tenant_resource_association", "AlreadyExistsException",
+           f"Resources {aws_arn} has already been associated with tenant {name}",
+           TenantName=name, ResourceArn=aws_arn)
+    inverse = sesv2.list_resource_tenants(ResourceArn=cn_arn)["ResourceTenants"]
+    assert [(item["TenantName"], item["ResourceArn"]) for item in inverse] == [(name, aws_arn)]
+    _error(sesv2, "delete_configuration_set", "BadRequestException",
+           f"Cannot delete <{aws_arn}> because it has tenant associations."
+           " Remove all tenant associations and try again.",
+           ConfigurationSetName=cs)
+    sesv2.delete_tenant_resource_association(TenantName=name, ResourceArn=aws_arn)
+    assert sesv2.list_tenant_resources(TenantName=name)["TenantResources"] == []
+    sesv2.create_tenant_resource_association(TenantName=name, ResourceArn=aws_arn)
+    sesv2.delete_tenant_resource_association(TenantName=name, ResourceArn=cn_arn)
+    assert sesv2.list_tenant_resources(TenantName=name)["TenantResources"] == []
+    xacct = f"arn:aws-cn:ses:us-east-1:111122223333:configuration-set/{cs}"
+    _error(sesv2, "create_tenant_resource_association", "BadRequestException",
+           f"Resource <{xacct}> must be in the same account",
+           TenantName=name, ResourceArn=xacct)
+    cn_tenant = tenant["TenantArn"].replace("arn:aws:", "arn:aws-cn:", 1)
+    sesv2.tag_resource(ResourceArn=cn_tenant, Tags=[{"Key": "pk", "Value": "v"}])
+    assert sesv2.list_tags_for_resource(ResourceArn=tenant["TenantArn"])["Tags"] == [
+        {"Key": "pk", "Value": "v"}
+    ]
+    sesv2.tag_resource(ResourceArn=cn_arn, Tags=[{"Key": "ck", "Value": "v"}])
+    assert sesv2.list_tags_for_resource(ResourceArn=aws_arn)["Tags"] == [
+        {"Key": "ck", "Value": "v"}
+    ]
+    sesv2.delete_tenant(TenantName=name)
+    sesv2.delete_configuration_set(ConfigurationSetName=cs)
